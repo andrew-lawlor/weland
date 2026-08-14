@@ -1,14 +1,14 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rusqlite::Connection;
 use std::collections::HashMap;
-use tauri::State;
+use std::fs;
+use std::path::PathBuf;
+use tauri::{AppHandle, Manager, State};
 
 use weland::db::{self, NewAnnotation, SearchHit};
 use weland::schema::{AstNode, TocEntry, UserAnnotation};
 
 use crate::AppState;
-
-const LOCAL_READER: &str = "Local Reader";
 
 #[derive(serde::Serialize)]
 pub struct BookPayload {
@@ -49,6 +49,7 @@ pub fn create_highlight(
     start_offset: i64,
     end_offset: i64,
     selected_text: Option<String>,
+    author_name: String,
     state: State<AppState>,
 ) -> Result<UserAnnotation, String> {
     let guard = state.db.lock().map_err(|e| e.to_string())?;
@@ -63,7 +64,7 @@ pub fn create_highlight(
             annotation_type: "highlight".to_string(),
             comment: None,
             asset_id: None,
-            author_name: LOCAL_READER.to_string(),
+            author_name,
         },
     )
     .map_err(|e| e.to_string())
@@ -76,6 +77,7 @@ pub fn create_text_note(
     end_offset: i64,
     selected_text: Option<String>,
     comment: String,
+    author_name: String,
     state: State<AppState>,
 ) -> Result<UserAnnotation, String> {
     let guard = state.db.lock().map_err(|e| e.to_string())?;
@@ -90,7 +92,7 @@ pub fn create_text_note(
             annotation_type: "text_note".to_string(),
             comment: Some(comment),
             asset_id: None,
-            author_name: LOCAL_READER.to_string(),
+            author_name,
         },
     )
     .map_err(|e| e.to_string())
@@ -104,6 +106,7 @@ pub fn save_voice_note(
     selected_text: Option<String>,
     audio_base64: String,
     mime_type: String,
+    author_name: String,
     state: State<AppState>,
 ) -> Result<UserAnnotation, String> {
     let guard = state.db.lock().map_err(|e| e.to_string())?;
@@ -125,7 +128,7 @@ pub fn save_voice_note(
             annotation_type: "voice_note".to_string(),
             comment: None,
             asset_id: Some(asset_id),
-            author_name: LOCAL_READER.to_string(),
+            author_name,
         },
     )
     .map_err(|e| e.to_string())
@@ -143,4 +146,51 @@ pub fn delete_annotation(id: i64, state: State<AppState>) -> Result<(), String> 
     let guard = state.db.lock().map_err(|e| e.to_string())?;
     let conn = locked_conn(&guard)?;
     db::delete_annotation(conn, id).map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize)]
+pub struct AuthorInfo {
+    pub name: String,
+    pub is_saved: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Settings {
+    author_name: String,
+}
+
+fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("settings.json"))
+}
+
+// `whoami::realname()` gives the OS account's display name where the OS tracks one
+// (macOS full name, Windows display name, Linux GECOS field); it falls back to the
+// login username when nothing is set, which is common on Linux.
+fn guess_os_author_name() -> String {
+    let name = whoami::realname();
+    if name.trim().is_empty() {
+        whoami::username()
+    } else {
+        name
+    }
+}
+
+#[tauri::command]
+pub fn get_author_name(app: AppHandle) -> Result<AuthorInfo, String> {
+    let path = settings_path(&app)?;
+    if let Ok(data) = fs::read_to_string(&path) {
+        if let Ok(settings) = serde_json::from_str::<Settings>(&data) {
+            return Ok(AuthorInfo { name: settings.author_name, is_saved: true });
+        }
+    }
+    Ok(AuthorInfo { name: guess_os_author_name(), is_saved: false })
+}
+
+#[tauri::command]
+pub fn set_author_name(name: String, app: AppHandle) -> Result<(), String> {
+    let path = settings_path(&app)?;
+    let data = serde_json::to_string_pretty(&Settings { author_name: name }).map_err(|e| e.to_string())?;
+    fs::write(&path, data).map_err(|e| e.to_string())
 }

@@ -58,6 +58,8 @@ fn main() {
             commands::save_voice_note,
             commands::update_note,
             commands::delete_annotation,
+            commands::get_author_name,
+            commands::set_author_name,
         ])
         .run(tauri::generate_context!())
         .expect("error while running weland-reader");

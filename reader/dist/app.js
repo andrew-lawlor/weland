@@ -7,6 +7,7 @@ let currentBook = null;
 let nodeElById = new Map();
 let nodeDataById = new Map();
 let annotationsByNode = new Map();
+let currentAuthorName = 'Reader';
 
 /* ================= HTML / span rendering ================= */
 
@@ -352,6 +353,59 @@ function renderBook(book) {
   document.getElementById('appFrame').hidden = false;
 }
 
+/* ================= Author name ================= */
+
+function setAuthorButtonLabel() {
+  document.getElementById('authorBtn').textContent = currentAuthorName;
+}
+
+function openAuthorModal(prefill, allowCancel) {
+  const modal = document.getElementById('authorModal');
+  document.getElementById('authorNameInput').value = prefill;
+  document.getElementById('authorCancel').hidden = !allowCancel;
+  modal.hidden = false;
+  const input = document.getElementById('authorNameInput');
+  input.focus();
+  input.select();
+}
+
+function closeAuthorModal() {
+  document.getElementById('authorModal').hidden = true;
+}
+
+document.getElementById('authorCancel').addEventListener('click', closeAuthorModal);
+
+document.getElementById('authorSave').addEventListener('click', async () => {
+  const name = document.getElementById('authorNameInput').value.trim();
+  if (!name) return;
+  try {
+    await invoke('set_author_name', { name });
+    currentAuthorName = name;
+    setAuthorButtonLabel();
+  } catch (err) {
+    console.error('Failed to save author name', err);
+  }
+  closeAuthorModal();
+});
+
+document.getElementById('authorBtn').addEventListener('click', () => {
+  openAuthorModal(currentAuthorName, true);
+});
+
+(async function initAuthor() {
+  try {
+    const info = await invoke('get_author_name');
+    currentAuthorName = info.name;
+    setAuthorButtonLabel();
+    if (!info.is_saved) {
+      openAuthorModal(info.name, false);
+    }
+  } catch (err) {
+    console.error('Failed to load author name', err);
+    setAuthorButtonLabel();
+  }
+})();
+
 document.getElementById('openBookBtn').addEventListener('click', async () => {
   const errorEl = document.getElementById('openError');
   errorEl.hidden = true;
@@ -516,6 +570,7 @@ document.getElementById('selectionToolbar').addEventListener('click', async (e) 
         startOffset: sel.start,
         endOffset: sel.end,
         selectedText: sel.text,
+        authorName: currentAuthorName,
       });
       addAnnotation(ann);
     } catch (err) {
@@ -568,6 +623,7 @@ document.getElementById('noteSave').addEventListener('click', async () => {
         endOffset: notePending.end,
         selectedText: notePending.text,
         comment: text,
+        authorName: currentAuthorName,
       });
       addAnnotation(ann);
     }
@@ -637,6 +693,7 @@ async function onRecordingStop() {
       selectedText: sel.text,
       audioBase64,
       mimeType,
+      authorName: currentAuthorName,
     });
     addAnnotation(ann);
   } catch (err) {
