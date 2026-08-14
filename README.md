@@ -41,6 +41,72 @@ cd reader/src-tauri
 cargo run
 ```
 
+## The spec
+
+A `.wld` file is a plain SQLite database — six tables, no proprietary container, readable by anything that speaks SQL:
+
+```mermaid
+erDiagram
+    ast_nodes ||--o{ ast_nodes : parent_id
+    ast_nodes ||--o{ user_annotations : node_id
+    ast_nodes ||--o| table_of_contents : target_node_id
+    ast_nodes ||--|| fts_nodes : "id = rowid"
+    table_of_contents ||--o{ table_of_contents : parent_id
+    assets ||--o{ user_annotations : asset_id
+
+    metadata {
+        text key PK
+        text value
+    }
+    ast_nodes {
+        integer id PK
+        integer parent_id FK
+        integer ordinal
+        text node_type
+        text content
+        json attributes
+    }
+    assets {
+        integer id PK
+        text hash UK
+        text mime_type
+        blob data
+    }
+    user_annotations {
+        integer id PK
+        integer node_id FK
+        integer start_offset
+        integer end_offset
+        text selected_text
+        text type
+        text comment
+        integer asset_id FK
+        text author_name
+        text author_id
+        text device_id
+        datetime created_at
+        datetime updated_at
+    }
+    table_of_contents {
+        integer id PK
+        integer parent_id FK
+        integer ordinal
+        text title
+        integer target_node_id FK
+        text href
+    }
+    fts_nodes {
+        text content
+    }
+```
+
+- **`metadata`** — flat key/value pairs: `title`, `author`, `language`, `description`, `identifier`, `publisher`, `cover_asset_id`.
+- **`ast_nodes`** — the book itself, as a tree (`parent_id` self-reference) ordered by `ordinal`. `node_type` is one of `heading`, `paragraph`, `blockquote`, `list`, `table`, `image`, `thematic_break`, `footnote`. `attributes` is free-form JSON per type — headings carry `level`, images carry `asset_id`/`alt`/`caption`, tables carry `rows`, and text-bearing types carry `spans`: an array of `{ start, end, type }` marking inline formatting over `content` — `bold`, `italic`, `code`, `strikethrough`, `underline`, `highlight`, or `link` (with an `href`).
+- **`assets`** — binary blobs (cover art, embedded images, recorded voice notes), content-hash deduped so the same image never gets stored twice.
+- **`user_annotations`** — highlights, text notes, and voice notes, anchored to a node via `start_offset`/`end_offset`: **Unicode codepoint offsets into that node's `content`**, the same coordinate space `spans` uses — so an annotation survives font changes and reflow, because it was never tied to pixels in the first place. `type` is `highlight`, `text_note`, or `voice_note` today; `ink_sketch` is reserved in the schema for future drawing support. `asset_id` links a voice note to its audio blob.
+- **`table_of_contents`** — a tree (again via `parent_id`) independent of the AST's own nesting, each entry optionally pointing at the `ast_nodes` row it should jump to.
+- **`fts_nodes`** — an FTS5 index mirroring `ast_nodes.content`, powering `weland search` and the reader's search bar.
+
 ## Who this is for
 
 Not aimed at dethroning EPUB by force of adoption — built for the people EPUB was never built for:
