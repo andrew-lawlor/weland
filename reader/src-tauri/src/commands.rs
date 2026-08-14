@@ -17,6 +17,7 @@ pub struct BookPayload {
     pub toc: Vec<TocEntry>,
     pub nodes: Vec<AstNode>,
     pub annotations: Vec<UserAnnotation>,
+    pub last_position_node_id: Option<i64>,
 }
 
 fn locked_conn<'a>(guard: &'a std::sync::MutexGuard<'_, Option<Connection>>) -> Result<&'a Connection, String> {
@@ -38,12 +39,16 @@ pub fn open_book(path: String, state: State<AppState>, app: AppHandle) -> Result
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "Untitled".to_string())
     });
+    // Read the saved position before upserting — upsert doesn't touch it, but
+    // reading it first keeps this independent of that ordering.
+    let last_position_node_id = find_last_position(&app, &path);
+
     // Library bookkeeping is best-effort — a failure here shouldn't stop the book from opening.
     let _ = upsert_library_entry(&app, &path, &title, metadata.get("author").map(|s| s.as_str()));
 
     *state.db.lock().map_err(|e| e.to_string())? = Some(conn);
 
-    Ok(BookPayload { path, metadata, toc, nodes, annotations })
+    Ok(BookPayload { path, metadata, toc, nodes, annotations, last_position_node_id })
 }
 
 #[tauri::command]
@@ -265,6 +270,8 @@ struct LibraryEntry {
     author: Option<String>,
     added_at: i64,
     last_opened_at: i64,
+    #[serde(default)]
+    last_position_node_id: Option<i64>,
 }
 
 #[derive(serde::Serialize)]
@@ -319,9 +326,28 @@ fn upsert_library_entry(app: &AppHandle, path: &str, title: &str, author: Option
             author: author.map(|s| s.to_string()),
             added_at: now,
             last_opened_at: now,
+            last_position_node_id: None,
         });
     }
     write_library(app, &entries)
+}
+
+fn find_last_position(app: &AppHandle, path: &str) -> Option<i64> {
+    read_library(app)
+        .ok()?
+        .into_iter()
+        .find(|e| e.path == path)?
+        .last_position_node_id
+}
+
+#[tauri::command]
+pub fn update_reading_position(path: String, node_id: i64, app: AppHandle) -> Result<(), String> {
+    let mut entries = read_library(&app)?;
+    if let Some(existing) = entries.iter_mut().find(|e| e.path == path) {
+        existing.last_position_node_id = Some(node_id);
+        write_library(&app, &entries)?;
+    }
+    Ok(())
 }
 
 // Opens a book's own database read-only just to pull its cover thumbnail —

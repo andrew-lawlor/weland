@@ -69,6 +69,7 @@ fn main() {
             commands::remove_from_library,
             commands::get_reading_settings,
             commands::set_reading_settings,
+            commands::update_reading_position,
         ])
         .run(tauri::generate_context!())
         .expect("error while running weland-reader");

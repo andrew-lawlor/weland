@@ -292,6 +292,7 @@ function addAnnotation(ann) {
 
 let tocLinkByNodeId = new Map();
 let tocTargets = []; // [{ nodeId, el }] in document order, for scroll-spy
+let allNodeTargets = []; // [{ nodeId, el }] for every node, in document order, for resume-position
 let activeTocNodeId = null;
 
 function setActiveTocLink(link) {
@@ -345,6 +346,12 @@ function easeInOutCubic(t) {
 // A hand-rolled scroll instead of scrollIntoView({behavior:'smooth'}) — the
 // native version's duration/easing is fixed regardless of distance, which
 // reads as slow and janky on a long jump and abrupt on a short one.
+// Bumped on every call so a new scroll always supersedes one still in
+// flight — without this, holding a key down (repeated keydown faster than
+// the animation duration) stacks up multiple rAF loops that fight over
+// scrollTop each frame, which looks janky and barely moves.
+let scrollAnimId = 0;
+
 function smoothScrollTo(container, targetTop, duration) {
   const startTop = container.scrollTop;
   const delta = targetTop - startTop;
@@ -355,8 +362,10 @@ function smoothScrollTo(container, targetTop, duration) {
     return;
   }
 
+  const myId = ++scrollAnimId;
   const start = performance.now();
   function step(now) {
+    if (myId !== scrollAnimId) return;
     const t = Math.min(1, (now - start) / duration);
     container.scrollTop = startTop + delta * easeInOutCubic(t);
     if (t < 1) requestAnimationFrame(step);
@@ -440,14 +449,64 @@ function renderBook(book) {
   tocTargets = book.nodes
     .filter((node) => tocLinkByNodeId.has(node.id))
     .map((node) => ({ nodeId: node.id, el: nodeElById.get(node.id) }));
+  allNodeTargets = book.nodes.map((node) => ({ nodeId: node.id, el: nodeElById.get(node.id) }));
   activeTocNodeId = null;
 
   document.getElementById('emptyState').hidden = true;
   document.getElementById('appFrame').hidden = false;
   document.getElementById('annotationsPanel').hidden = true;
+  restoreReadingPosition(book.last_position_node_id);
   updateActiveTocEntry();
   updateAnnotationsCount(allAnnotationsInOrder());
 }
+
+// Jumps straight to a saved position with no animation — this is restoring
+// where the reader already was, not a user-triggered navigation.
+function restoreReadingPosition(nodeId) {
+  if (nodeId == null) return;
+  const el = nodeElById.get(nodeId);
+  const pane = document.getElementById('readingPane');
+  if (!el) return;
+  pane.scrollTop = Math.max(0, pane.scrollTop + (el.getBoundingClientRect().top - pane.getBoundingClientRect().top));
+}
+
+// Finds whichever node is nearest the top of the reading pane right now —
+// same "sorted insertion points, scan for the last one past the threshold"
+// approach as the TOC scroll-spy, just over every node instead of only
+// TOC targets.
+function findTopVisibleNodeId() {
+  if (allNodeTargets.length === 0) return null;
+  const pane = document.getElementById('readingPane');
+  const threshold = pane.getBoundingClientRect().top + 40;
+
+  let current = allNodeTargets[0];
+  for (const target of allNodeTargets) {
+    if (!target.el) continue;
+    if (target.el.getBoundingClientRect().top <= threshold) {
+      current = target;
+    } else {
+      break;
+    }
+  }
+  return current.nodeId;
+}
+
+async function saveReadingPosition() {
+  if (!currentBook) return;
+  const nodeId = findTopVisibleNodeId();
+  if (nodeId == null) return;
+  try {
+    await invoke('update_reading_position', { path: currentBook.path, nodeId });
+  } catch (err) {
+    console.error('Failed to save reading position', err);
+  }
+}
+
+let positionSaveTimeout = null;
+document.getElementById('readingPane').addEventListener('scroll', () => {
+  clearTimeout(positionSaveTimeout);
+  positionSaveTimeout = setTimeout(saveReadingPosition, 600);
+});
 
 /* ================= Author name ================= */
 
@@ -637,6 +696,8 @@ document.getElementById('librarySearch').addEventListener('input', (e) => {
 });
 
 document.getElementById('libraryBtn').addEventListener('click', () => {
+  clearTimeout(positionSaveTimeout);
+  saveReadingPosition();
   document.getElementById('appFrame').hidden = true;
   document.getElementById('emptyState').hidden = false;
   loadLibrary();
@@ -1192,4 +1253,119 @@ document.addEventListener('keydown', (e) => {
   hideSelectionToolbar();
   document.getElementById('noteComposer').hidden = true;
   document.getElementById('searchResults').hidden = true;
+  document.getElementById('annotationsPanel').hidden = true;
+  document.getElementById('textSettingsPanel').hidden = true;
+});
+
+/* ================= Keyboard navigation ================= */
+
+function isTypingInField() {
+  const el = document.activeElement;
+  if (!el) return false;
+  return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable;
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+// A held arrow key fires OS keydown-repeat faster than any short eased
+// animation can finish, so each restart gets cut off mid-ramp-up and net
+// movement crawls. Once a key is confirmed held (e.repeat), switch to real
+// constant-velocity scrolling driven by our own rAF loop instead of trying
+// to animate a series of discrete steps.
+const HELD_SCROLL_SPEED = 900; // px/sec
+let heldScrollDirection = 0;
+let heldScrollRafId = null;
+let heldScrollLastTime = 0;
+
+function heldScrollStep(now) {
+  if (heldScrollDirection === 0) {
+    heldScrollRafId = null;
+    return;
+  }
+  const pane = document.getElementById('readingPane');
+  const dt = (now - heldScrollLastTime) / 1000;
+  heldScrollLastTime = now;
+  const maxScroll = pane.scrollHeight - pane.clientHeight;
+  pane.scrollTop = clamp(pane.scrollTop + heldScrollDirection * HELD_SCROLL_SPEED * dt, 0, maxScroll);
+  heldScrollRafId = requestAnimationFrame(heldScrollStep);
+}
+
+function startHeldScroll(direction) {
+  scrollAnimId++; // cancel any in-flight eased jump so it can't fight this
+  if (heldScrollDirection === direction) return;
+  heldScrollDirection = direction;
+  if (heldScrollRafId == null) {
+    heldScrollLastTime = performance.now();
+    heldScrollRafId = requestAnimationFrame(heldScrollStep);
+  }
+}
+
+function stopHeldScroll(direction) {
+  if (heldScrollDirection === direction) heldScrollDirection = 0;
+}
+
+document.addEventListener('keyup', (e) => {
+  if (e.key === 'ArrowDown') stopHeldScroll(1);
+  else if (e.key === 'ArrowUp') stopHeldScroll(-1);
+});
+
+// Safety net: if focus leaves the window mid-hold (e.g. alt-tab), no keyup
+// ever fires and the scroll would otherwise run forever.
+window.addEventListener('blur', () => {
+  heldScrollDirection = 0;
+});
+
+document.addEventListener('keydown', (e) => {
+  // Cmd/Ctrl+F focuses search regardless of what's currently focused.
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'f') {
+    if (document.getElementById('appFrame').hidden) return;
+    e.preventDefault();
+    const input = document.getElementById('searchInput');
+    input.focus();
+    input.select();
+    return;
+  }
+
+  if (isTypingInField()) return;
+  if (document.getElementById('appFrame').hidden) return;
+
+  const pane = document.getElementById('readingPane');
+  const maxScroll = pane.scrollHeight - pane.clientHeight;
+  const pageStep = pane.clientHeight * 0.9;
+  const lineStep = 110;
+
+  switch (e.key) {
+    case ' ':
+      e.preventDefault();
+      smoothScrollTo(pane, clamp(pane.scrollTop + (e.shiftKey ? -pageStep : pageStep), 0, maxScroll), 320);
+      break;
+    case 'PageDown':
+      e.preventDefault();
+      smoothScrollTo(pane, clamp(pane.scrollTop + pageStep, 0, maxScroll), 320);
+      break;
+    case 'PageUp':
+      e.preventDefault();
+      smoothScrollTo(pane, clamp(pane.scrollTop - pageStep, 0, maxScroll), 320);
+      break;
+    case 'ArrowDown':
+      e.preventDefault();
+      if (e.repeat) startHeldScroll(1);
+      else smoothScrollTo(pane, clamp(pane.scrollTop + lineStep, 0, maxScroll), 160);
+      break;
+    case 'ArrowUp':
+      e.preventDefault();
+      if (e.repeat) startHeldScroll(-1);
+      else smoothScrollTo(pane, clamp(pane.scrollTop - lineStep, 0, maxScroll), 160);
+      break;
+    case 'Home':
+      e.preventDefault();
+      smoothScrollTo(pane, 0, 400);
+      break;
+    case 'End':
+      e.preventDefault();
+      smoothScrollTo(pane, maxScroll, 400);
+      break;
+  }
 });
