@@ -280,7 +280,17 @@ function addAnnotation(ann) {
 
 /* ================= Table of contents ================= */
 
+let tocLinkByNodeId = new Map();
+let tocTargets = []; // [{ nodeId, el }] in document order, for scroll-spy
+let activeTocNodeId = null;
+
+function setActiveTocLink(link) {
+  document.querySelectorAll('.toc a.active').forEach((el) => el.classList.remove('active'));
+  if (link) link.classList.add('active');
+}
+
 function renderToc(tocEntries) {
+  tocLinkByNodeId = new Map();
   const byParent = new Map();
   for (const entry of tocEntries) {
     const key = entry.parent_id == null ? 'root' : entry.parent_id;
@@ -299,10 +309,11 @@ function renderToc(tocEntries) {
       a.textContent = entry.title;
       a.addEventListener('click', (e) => {
         e.preventDefault();
-        document.querySelectorAll('.toc a.active').forEach((el) => el.classList.remove('active'));
-        a.classList.add('active');
+        activeTocNodeId = entry.target_node_id;
+        setActiveTocLink(a);
         if (entry.target_node_id != null) jumpToNode(entry.target_node_id);
       });
+      if (entry.target_node_id != null) tocLinkByNodeId.set(entry.target_node_id, a);
       li.appendChild(a);
       const nested = buildList(entry.id);
       if (nested) li.appendChild(nested);
@@ -321,6 +332,40 @@ function jumpToNode(nodeId) {
   const el = nodeElById.get(nodeId);
   if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
+
+/* ================= TOC scroll-spy ================= */
+
+function updateActiveTocEntry() {
+  if (tocTargets.length === 0) return;
+  const pane = document.getElementById('readingPane');
+  const threshold = pane.getBoundingClientRect().top + 96;
+
+  let current = tocTargets[0];
+  for (const target of tocTargets) {
+    if (!target.el) continue;
+    if (target.el.getBoundingClientRect().top <= threshold) {
+      current = target;
+    } else {
+      break;
+    }
+  }
+
+  if (current.nodeId === activeTocNodeId) return;
+  activeTocNodeId = current.nodeId;
+  const link = tocLinkByNodeId.get(current.nodeId);
+  setActiveTocLink(link);
+  if (link) link.scrollIntoView({ block: 'nearest' });
+}
+
+let tocScrollSpyScheduled = false;
+document.getElementById('readingPane').addEventListener('scroll', () => {
+  if (tocScrollSpyScheduled) return;
+  tocScrollSpyScheduled = true;
+  requestAnimationFrame(() => {
+    tocScrollSpyScheduled = false;
+    updateActiveTocEntry();
+  });
+});
 
 /* ================= Book loading ================= */
 
@@ -348,9 +393,14 @@ function renderBook(book) {
   }
 
   renderToc(book.toc);
+  tocTargets = book.nodes
+    .filter((node) => tocLinkByNodeId.has(node.id))
+    .map((node) => ({ nodeId: node.id, el: nodeElById.get(node.id) }));
+  activeTocNodeId = null;
 
   document.getElementById('emptyState').hidden = true;
   document.getElementById('appFrame').hidden = false;
+  updateActiveTocEntry();
 }
 
 /* ================= Author name ================= */
