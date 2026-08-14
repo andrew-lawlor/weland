@@ -67,6 +67,8 @@ fn main() {
             commands::set_author_name,
             commands::list_library,
             commands::remove_from_library,
+            commands::get_reading_settings,
+            commands::set_reading_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running weland-reader");

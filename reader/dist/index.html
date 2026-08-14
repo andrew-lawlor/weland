@@ -22,6 +22,7 @@
     <p id="openError" class="open-error" hidden></p>
 
     <div id="libraryEmptyState" class="library-empty">
+      <img id="libraryEmptyGif" class="library-empty-gif" src="forge-anvil.gif" alt="" />
       <p>Open a <code>.wld</code> file to start reading — it'll show up here next time you launch.</p>
     </div>
 
@@ -32,6 +33,9 @@
   <div id="appFrame" class="app-frame" hidden>
     <div class="app-titlebar">
       <div class="tb-left">
+        <button class="tb-toc-toggle" id="tocToggleBtn" aria-label="Toggle contents panel" title="Toggle contents panel">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="9.5" y1="4" x2="9.5" y2="20"/></svg>
+        </button>
         <button class="tb-library" id="libraryBtn" aria-label="Back to library" title="Back to library">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
         </button>
@@ -49,13 +53,14 @@
           <span class="tb-annotations-count" id="annotationsCount" hidden>0</span>
         </button>
         <span class="tb-pill">FTS5 indexed</span>
+        <button class="tb-text-settings" id="textSettingsBtn" aria-label="Reading settings" title="Reading settings">Aa</button>
         <button class="mode-toggle" id="modeToggle" aria-label="Toggle day / night reading mode" title="Day / night reading mode">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8Z"/></svg>
         </button>
       </div>
     </div>
 
-    <div class="app-body">
+    <div class="app-body" id="appBody">
       <nav class="toc" aria-label="Table of contents">
         <h2>Contents</h2>
         <ol id="tocList"></ol>
@@ -108,6 +113,30 @@
       <div class="author-modal-actions">
         <button id="authorCancel" hidden>Cancel</button>
         <button id="authorSave" class="btn-primary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ Reading settings popover ============ -->
+  <div id="textSettingsPanel" class="text-settings-panel" hidden>
+    <div class="ts-group">
+      <span class="ts-label">Font</span>
+      <div class="ts-fonts" id="tsFontOptions"></div>
+    </div>
+    <div class="ts-group">
+      <span class="ts-label">Size</span>
+      <div class="ts-stepper">
+        <button type="button" id="tsSizeDown" aria-label="Decrease font size">–</button>
+        <span id="tsSizeValue"></span>
+        <button type="button" id="tsSizeUp" aria-label="Increase font size">+</button>
+      </div>
+    </div>
+    <div class="ts-group">
+      <span class="ts-label">Line spacing</span>
+      <div class="ts-stepper">
+        <button type="button" id="tsLeadingDown" aria-label="Decrease line spacing">–</button>
+        <span id="tsLeadingValue"></span>
+        <button type="button" id="tsLeadingUp" aria-label="Increase line spacing">+</button>
       </div>
     </div>
   </div>

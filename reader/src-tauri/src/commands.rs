@@ -164,15 +164,39 @@ pub struct AuthorInfo {
     pub is_saved: bool,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+// All fields optional so an older settings.json (or one only ever touched by one
+// of get/set_author_name vs get/set_reading_settings) still parses fine, and a
+// read-modify-write of one group of fields never clobbers the other.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
 struct Settings {
-    author_name: String,
+    #[serde(default)]
+    author_name: Option<String>,
+    #[serde(default)]
+    reading_font: Option<String>,
+    #[serde(default)]
+    reading_size_px: Option<f64>,
+    #[serde(default)]
+    reading_leading: Option<f64>,
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir.join("settings.json"))
+}
+
+fn read_settings(app: &AppHandle) -> Settings {
+    settings_path(app)
+        .ok()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|data| serde_json::from_str(&data).ok())
+        .unwrap_or_default()
+}
+
+fn write_settings(app: &AppHandle, settings: &Settings) -> Result<(), String> {
+    let path = settings_path(app)?;
+    let data = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
+    fs::write(&path, data).map_err(|e| e.to_string())
 }
 
 // `whoami::realname()` gives the OS account's display name where the OS tracks one
@@ -189,20 +213,47 @@ fn guess_os_author_name() -> String {
 
 #[tauri::command]
 pub fn get_author_name(app: AppHandle) -> Result<AuthorInfo, String> {
-    let path = settings_path(&app)?;
-    if let Ok(data) = fs::read_to_string(&path) {
-        if let Ok(settings) = serde_json::from_str::<Settings>(&data) {
-            return Ok(AuthorInfo { name: settings.author_name, is_saved: true });
-        }
+    match read_settings(&app).author_name {
+        Some(name) => Ok(AuthorInfo { name, is_saved: true }),
+        None => Ok(AuthorInfo { name: guess_os_author_name(), is_saved: false }),
     }
-    Ok(AuthorInfo { name: guess_os_author_name(), is_saved: false })
 }
 
 #[tauri::command]
 pub fn set_author_name(name: String, app: AppHandle) -> Result<(), String> {
-    let path = settings_path(&app)?;
-    let data = serde_json::to_string_pretty(&Settings { author_name: name }).map_err(|e| e.to_string())?;
-    fs::write(&path, data).map_err(|e| e.to_string())
+    let mut settings = read_settings(&app);
+    settings.author_name = Some(name);
+    write_settings(&app, &settings)
+}
+
+const DEFAULT_READING_FONT: &str = "literata";
+const DEFAULT_READING_SIZE_PX: f64 = 17.0;
+const DEFAULT_READING_LEADING: f64 = 1.75;
+
+#[derive(serde::Serialize)]
+pub struct ReadingSettings {
+    pub font: String,
+    pub size_px: f64,
+    pub leading: f64,
+}
+
+#[tauri::command]
+pub fn get_reading_settings(app: AppHandle) -> Result<ReadingSettings, String> {
+    let s = read_settings(&app);
+    Ok(ReadingSettings {
+        font: s.reading_font.unwrap_or_else(|| DEFAULT_READING_FONT.to_string()),
+        size_px: s.reading_size_px.unwrap_or(DEFAULT_READING_SIZE_PX),
+        leading: s.reading_leading.unwrap_or(DEFAULT_READING_LEADING),
+    })
+}
+
+#[tauri::command]
+pub fn set_reading_settings(font: String, size_px: f64, leading: f64, app: AppHandle) -> Result<(), String> {
+    let mut settings = read_settings(&app);
+    settings.reading_font = Some(font);
+    settings.reading_size_px = Some(size_px);
+    settings.reading_leading = Some(leading);
+    write_settings(&app, &settings)
 }
 
 /* ================= Library ================= */

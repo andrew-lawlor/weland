@@ -338,9 +338,41 @@ function renderToc(tocEntries) {
   if (built) while (built.firstChild) list.appendChild(built.firstChild);
 }
 
+function easeInOutCubic(t) {
+  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+}
+
+// A hand-rolled scroll instead of scrollIntoView({behavior:'smooth'}) — the
+// native version's duration/easing is fixed regardless of distance, which
+// reads as slow and janky on a long jump and abrupt on a short one.
+function smoothScrollTo(container, targetTop, duration) {
+  const startTop = container.scrollTop;
+  const delta = targetTop - startTop;
+  if (Math.abs(delta) < 1) return;
+
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    container.scrollTop = targetTop;
+    return;
+  }
+
+  const start = performance.now();
+  function step(now) {
+    const t = Math.min(1, (now - start) / duration);
+    container.scrollTop = startTop + delta * easeInOutCubic(t);
+    if (t < 1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
 function jumpToNode(nodeId) {
   const el = nodeElById.get(nodeId);
-  if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  const pane = document.getElementById('readingPane');
+  if (!el || !pane) return;
+
+  const targetTop = Math.max(0, pane.scrollTop + (el.getBoundingClientRect().top - pane.getBoundingClientRect().top) - 16);
+  const distance = Math.abs(targetTop - pane.scrollTop);
+  const duration = Math.min(650, Math.max(220, distance * 0.35));
+  smoothScrollTo(pane, targetTop, duration);
 }
 
 /* ================= TOC scroll-spy ================= */
@@ -389,6 +421,8 @@ function renderBook(book) {
 
   document.getElementById('bookTitle').textContent = book.metadata.title || 'Untitled';
   document.getElementById('bookByline').textContent = book.metadata.author ? `by ${book.metadata.author}` : '';
+
+  document.getElementById('readingPane').scrollTop = 0;
 
   const article = document.getElementById('readingArticle');
   article.innerHTML = '';
@@ -507,6 +541,7 @@ function renderLibrary(filterText) {
     search.hidden = true;
     grid.hidden = true;
     emptyState.hidden = false;
+    document.getElementById('libraryEmptyGif').hidden = false;
     emptyState.querySelector('p').textContent =
       "Open a .wld file to start reading — it'll show up here next time you launch.";
     return;
@@ -523,6 +558,7 @@ function renderLibrary(filterText) {
   if (filtered.length === 0) {
     grid.hidden = true;
     emptyState.hidden = false;
+    document.getElementById('libraryEmptyGif').hidden = true;
     emptyState.querySelector('p').textContent = `No books match "${filterText}".`;
     return;
   }
@@ -604,6 +640,13 @@ document.getElementById('libraryBtn').addEventListener('click', () => {
   document.getElementById('appFrame').hidden = true;
   document.getElementById('emptyState').hidden = false;
   loadLibrary();
+});
+
+// Session-only: resets to expanded on next launch, nothing persisted.
+document.getElementById('tocToggleBtn').addEventListener('click', () => {
+  const body = document.getElementById('appBody');
+  const collapsed = body.getAttribute('data-toc') === 'collapsed';
+  body.setAttribute('data-toc', collapsed ? 'expanded' : 'collapsed');
 });
 
 loadLibrary();
@@ -802,6 +845,121 @@ document.getElementById('modeToggle').addEventListener('click', () => {
   const dark = frame.getAttribute('data-mode') === 'dark';
   frame.setAttribute('data-mode', dark ? 'light' : 'dark');
 });
+
+/* ================= Reading settings (font, size, line spacing) ================= */
+
+const READING_FONTS = [
+  { id: 'literata', label: 'Literata', stack: "'Literata', 'Iowan Old Style', 'Palatino Linotype', Georgia, serif" },
+  { id: 'lora', label: 'Lora', stack: "'Lora', 'Palatino Linotype', Georgia, serif" },
+  { id: 'crimson-pro', label: 'Crimson Pro', stack: "'Crimson Pro', 'Palatino Linotype', Georgia, serif" },
+  { id: 'spectral', label: 'Spectral', stack: "'Spectral', 'Palatino Linotype', Georgia, serif" },
+  { id: 'im-fell-english', label: 'IM Fell English', stack: "'IM Fell English', 'Palatino Linotype', Georgia, serif" },
+  { id: 'unifraktur-maguntia', label: 'Unifraktur', stack: "'UnifrakturMaguntia', 'Palatino Linotype', Georgia, serif" },
+  { id: 'source-sans-3', label: 'Source Sans 3', stack: "'Source Sans 3', 'Seravek', 'Segoe UI', sans-serif" },
+  { id: 'libre-franklin', label: 'Libre Franklin', stack: "'Libre Franklin', 'Seravek', 'Segoe UI', sans-serif" },
+];
+const READING_SIZE_MIN = 14;
+const READING_SIZE_MAX = 24;
+const READING_LEADING_MIN = 1.3;
+const READING_LEADING_MAX = 2.2;
+
+let readingSettings = { font: 'literata', size_px: 17, leading: 1.75 };
+
+function fontStackFor(fontId) {
+  return (READING_FONTS.find((f) => f.id === fontId) || READING_FONTS[0]).stack;
+}
+
+function applyReadingSettings() {
+  const pane = document.getElementById('readingPane');
+  pane.style.setProperty('--read-font', fontStackFor(readingSettings.font));
+  pane.style.setProperty('--read-size', `${readingSettings.size_px}px`);
+  pane.style.setProperty('--read-leading', String(readingSettings.leading));
+
+  document.getElementById('tsSizeValue').textContent = `${readingSettings.size_px}px`;
+  document.getElementById('tsLeadingValue').textContent = readingSettings.leading.toFixed(2);
+  document.querySelectorAll('.ts-font-option').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.font === readingSettings.font);
+  });
+}
+
+async function saveReadingSettings() {
+  try {
+    await invoke('set_reading_settings', {
+      font: readingSettings.font,
+      sizePx: readingSettings.size_px,
+      leading: readingSettings.leading,
+    });
+  } catch (err) {
+    console.error('Failed to save reading settings', err);
+  }
+}
+
+const fontOptionsEl = document.getElementById('tsFontOptions');
+for (const font of READING_FONTS) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'ts-font-option';
+  btn.dataset.font = font.id;
+  btn.style.fontFamily = font.stack;
+  btn.textContent = font.label;
+  btn.addEventListener('click', () => {
+    readingSettings.font = font.id;
+    applyReadingSettings();
+    saveReadingSettings();
+  });
+  fontOptionsEl.appendChild(btn);
+}
+
+document.getElementById('tsSizeDown').addEventListener('click', () => {
+  readingSettings.size_px = Math.max(READING_SIZE_MIN, readingSettings.size_px - 1);
+  applyReadingSettings();
+  saveReadingSettings();
+});
+document.getElementById('tsSizeUp').addEventListener('click', () => {
+  readingSettings.size_px = Math.min(READING_SIZE_MAX, readingSettings.size_px + 1);
+  applyReadingSettings();
+  saveReadingSettings();
+});
+document.getElementById('tsLeadingDown').addEventListener('click', () => {
+  readingSettings.leading = Math.max(READING_LEADING_MIN, Math.round((readingSettings.leading - 0.05) * 100) / 100);
+  applyReadingSettings();
+  saveReadingSettings();
+});
+document.getElementById('tsLeadingUp').addEventListener('click', () => {
+  readingSettings.leading = Math.min(READING_LEADING_MAX, Math.round((readingSettings.leading + 0.05) * 100) / 100);
+  applyReadingSettings();
+  saveReadingSettings();
+});
+
+document.getElementById('textSettingsBtn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  const panel = document.getElementById('textSettingsPanel');
+  if (!panel.hidden) {
+    panel.hidden = true;
+    return;
+  }
+  const btn = document.getElementById('textSettingsBtn');
+  const rect = btn.getBoundingClientRect();
+  panel.style.top = `${rect.bottom + 8}px`;
+  panel.style.right = `${window.innerWidth - rect.right}px`;
+  panel.hidden = false;
+});
+
+document.addEventListener('click', (e) => {
+  const panel = document.getElementById('textSettingsPanel');
+  if (panel.hidden) return;
+  if (panel.contains(e.target) || e.target.id === 'textSettingsBtn') return;
+  panel.hidden = true;
+});
+
+(async function initReadingSettings() {
+  try {
+    readingSettings = await invoke('get_reading_settings');
+  } catch (err) {
+    console.error('Failed to load reading settings', err);
+  }
+  applyReadingSettings();
+})();
 
 /* ================= Text selection -> annotate ================= */
 
