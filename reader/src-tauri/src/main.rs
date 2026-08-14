@@ -14,6 +14,11 @@ fn asset_response(mime: String, data: Vec<u8>) -> tauri::http::Response<Vec<u8>>
     tauri::http::Response::builder()
         .header("Content-Type", mime)
         .header("Access-Control-Allow-Origin", "*")
+        // Asset IDs are only unique within a single .wld's own `assets` table, so the
+        // same weland-asset://asset/<id> URL can point at completely different bytes
+        // in different books. Without this, the webview's HTTP cache happily serves
+        // a previous book's image for that URL instead of re-querying the DB.
+        .header("Cache-Control", "no-store")
         .status(200)
         .body(data)
         .unwrap()
@@ -60,6 +65,8 @@ fn main() {
             commands::delete_annotation,
             commands::get_author_name,
             commands::set_author_name,
+            commands::list_library,
+            commands::remove_from_library,
         ])
         .run(tauri::generate_context!())
         .expect("error while running weland-reader");

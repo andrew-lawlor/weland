@@ -7,20 +7,34 @@
 </head>
 <body>
 
-  <!-- ============ Empty state: no book open yet ============ -->
-  <div id="emptyState" class="empty-state">
-    <div class="empty-card">
-      <h1>Weland Reader</h1>
-      <p>Open a <code>.wld</code> file to start reading.</p>
-      <button id="openBookBtn" class="btn-primary">Open a book…</button>
-      <p id="openError" class="open-error" hidden></p>
+  <!-- ============ Library: landing view, no book open ============ -->
+  <div id="emptyState" class="library-view">
+    <header class="library-topbar">
+      <h1>
+        <svg class="library-logo" viewBox="-10 -21 240 240" aria-hidden="true"><g transform="rotate(-35 100 100)"><path fill="#000000" fill-rule="evenodd" d="M100,12 L94,-4 L100,-16 L106,-4 L100,12 A88,88 0 0,1 100,188 L106,202 L100,214 L94,202 L100,188 A44,44 0 0,1 100,100 A44,44 0 0,0 100,12 Z M100,40 m-13,0 a13,13 0 1,0 26,0 a13,13 0 1,0 -26,0 Z M128,155 m-12,0 a12,12 0 1,0 24,0 a12,12 0 1,0 -24,0 Z"/></g></svg>
+        Weland Reader
+      </h1>
+      <div class="library-topbar-actions">
+        <input type="text" id="librarySearch" class="library-search" placeholder="Search your library…" hidden />
+        <button id="openBookBtn" class="btn-primary">Open a book…</button>
+      </div>
+    </header>
+    <p id="openError" class="open-error" hidden></p>
+
+    <div id="libraryEmptyState" class="library-empty">
+      <p>Open a <code>.wld</code> file to start reading — it'll show up here next time you launch.</p>
     </div>
+
+    <ol id="libraryGrid" class="library-grid" hidden></ol>
   </div>
 
   <!-- ============ App shell ============ -->
   <div id="appFrame" class="app-frame" hidden>
     <div class="app-titlebar">
       <div class="tb-left">
+        <button class="tb-library" id="libraryBtn" aria-label="Back to library" title="Back to library">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+        </button>
         <span class="tb-title" id="bookTitle">—</span>
         <span class="tb-byline" id="bookByline"></span>
       </div>
@@ -30,6 +44,10 @@
       </div>
       <div class="tb-right">
         <button class="tb-author" id="authorBtn" title="Change your display name"></button>
+        <button class="tb-annotations" id="annotationsBtn" aria-label="Browse annotations" title="Browse annotations">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v13l-4 4H4z"/><line x1="8" y1="9" x2="16" y2="9"/><line x1="8" y1="13" x2="13" y2="13"/></svg>
+          <span class="tb-annotations-count" id="annotationsCount" hidden>0</span>
+        </button>
         <span class="tb-pill">FTS5 indexed</span>
         <button class="mode-toggle" id="modeToggle" aria-label="Toggle day / night reading mode" title="Day / night reading mode">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8Z"/></svg>
@@ -53,6 +71,14 @@
           <button id="closeSearchResults" aria-label="Close search results">&times;</button>
         </div>
         <ol id="searchResultsList"></ol>
+      </aside>
+
+      <aside class="search-results" id="annotationsPanel" hidden>
+        <div class="sr-header">
+          <span id="annotationsPanelTitle"></span>
+          <button id="closeAnnotationsPanel" aria-label="Close annotations">&times;</button>
+        </div>
+        <ol id="annotationsList"></ol>
       </aside>
     </div>
   </div>

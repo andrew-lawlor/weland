@@ -12,6 +12,7 @@ use crate::AppState;
 
 #[derive(serde::Serialize)]
 pub struct BookPayload {
+    pub path: String,
     pub metadata: HashMap<String, String>,
     pub toc: Vec<TocEntry>,
     pub nodes: Vec<AstNode>,
@@ -23,7 +24,7 @@ fn locked_conn<'a>(guard: &'a std::sync::MutexGuard<'_, Option<Connection>>) -> 
 }
 
 #[tauri::command]
-pub fn open_book(path: String, state: State<AppState>) -> Result<BookPayload, String> {
+pub fn open_book(path: String, state: State<AppState>, app: AppHandle) -> Result<BookPayload, String> {
     let conn = Connection::open(&path).map_err(|e| format!("Failed to open {path}: {e}"))?;
 
     let metadata = db::load_metadata(&conn).map_err(|e| e.to_string())?;
@@ -31,9 +32,18 @@ pub fn open_book(path: String, state: State<AppState>) -> Result<BookPayload, St
     let nodes = db::load_ast_nodes(&conn).map_err(|e| e.to_string())?;
     let annotations = db::load_annotations(&conn).map_err(|e| e.to_string())?;
 
+    let title = metadata.get("title").cloned().unwrap_or_else(|| {
+        std::path::Path::new(&path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "Untitled".to_string())
+    });
+    // Library bookkeeping is best-effort — a failure here shouldn't stop the book from opening.
+    let _ = upsert_library_entry(&app, &path, &title, metadata.get("author").map(|s| s.as_str()));
+
     *state.db.lock().map_err(|e| e.to_string())? = Some(conn);
 
-    Ok(BookPayload { metadata, toc, nodes, annotations })
+    Ok(BookPayload { path, metadata, toc, nodes, annotations })
 }
 
 #[tauri::command]
@@ -193,4 +203,115 @@ pub fn set_author_name(name: String, app: AppHandle) -> Result<(), String> {
     let path = settings_path(&app)?;
     let data = serde_json::to_string_pretty(&Settings { author_name: name }).map_err(|e| e.to_string())?;
     fs::write(&path, data).map_err(|e| e.to_string())
+}
+
+/* ================= Library ================= */
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct LibraryEntry {
+    path: String,
+    title: String,
+    author: Option<String>,
+    added_at: i64,
+    last_opened_at: i64,
+}
+
+#[derive(serde::Serialize)]
+pub struct LibraryBook {
+    pub path: String,
+    pub title: String,
+    pub author: Option<String>,
+    pub added_at: i64,
+    pub last_opened_at: i64,
+    pub cover_data_uri: Option<String>,
+    pub available: bool,
+}
+
+fn library_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("library.json"))
+}
+
+fn read_library(app: &AppHandle) -> Result<Vec<LibraryEntry>, String> {
+    let path = library_path(app)?;
+    match fs::read_to_string(&path) {
+        Ok(data) => Ok(serde_json::from_str(&data).unwrap_or_default()),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+fn write_library(app: &AppHandle, entries: &[LibraryEntry]) -> Result<(), String> {
+    let path = library_path(app)?;
+    let data = serde_json::to_string_pretty(entries).map_err(|e| e.to_string())?;
+    fs::write(&path, data).map_err(|e| e.to_string())
+}
+
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn upsert_library_entry(app: &AppHandle, path: &str, title: &str, author: Option<&str>) -> Result<(), String> {
+    let mut entries = read_library(app)?;
+    let now = now_epoch_secs();
+    if let Some(existing) = entries.iter_mut().find(|e| e.path == path) {
+        existing.title = title.to_string();
+        existing.author = author.map(|s| s.to_string());
+        existing.last_opened_at = now;
+    } else {
+        entries.push(LibraryEntry {
+            path: path.to_string(),
+            title: title.to_string(),
+            author: author.map(|s| s.to_string()),
+            added_at: now,
+            last_opened_at: now,
+        });
+    }
+    write_library(app, &entries)
+}
+
+// Opens a book's own database read-only just to pull its cover thumbnail —
+// never creates or modifies the file, so a stale/missing library path is safe.
+fn load_cover_data_uri(path: &str) -> anyhow::Result<Option<String>> {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let metadata = db::load_metadata(&conn)?;
+    let Some(cover_id_str) = metadata.get("cover_asset_id") else {
+        return Ok(None);
+    };
+    let cover_id: i64 = cover_id_str.parse()?;
+    let (mime, data) = db::load_asset(&conn, cover_id)?;
+    Ok(Some(format!("data:{};base64,{}", mime, STANDARD.encode(data))))
+}
+
+#[tauri::command]
+pub fn list_library(app: AppHandle) -> Result<Vec<LibraryBook>, String> {
+    let mut entries = read_library(&app)?;
+    entries.sort_by(|a, b| b.last_opened_at.cmp(&a.last_opened_at));
+
+    Ok(entries
+        .into_iter()
+        .map(|e| {
+            let available = std::path::Path::new(&e.path).exists();
+            let cover_data_uri = if available { load_cover_data_uri(&e.path).ok().flatten() } else { None };
+            LibraryBook {
+                path: e.path,
+                title: e.title,
+                author: e.author,
+                added_at: e.added_at,
+                last_opened_at: e.last_opened_at,
+                cover_data_uri,
+                available,
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub fn remove_from_library(path: String, app: AppHandle) -> Result<(), String> {
+    let mut entries = read_library(&app)?;
+    entries.retain(|e| e.path != path);
+    write_library(&app, &entries)
 }

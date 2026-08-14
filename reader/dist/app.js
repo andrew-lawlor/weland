@@ -4,6 +4,15 @@ const { invoke } = window.__TAURI__.core;
 const dialogApi = window.__TAURI__.dialog;
 
 let currentBook = null;
+
+// Asset row IDs only reset per-.wld file, so weland-asset://asset/<id> can point
+// at completely different bytes across books. The webview's resource cache keys
+// purely on URL, so tag the query string with the open book's path to keep the
+// URL — not just the id — unique per book and avoid serving a stale image.
+function assetUrl(assetId) {
+  return `weland-asset://asset/${assetId}?b=${encodeURIComponent(currentBook.path)}`;
+}
+
 let nodeElById = new Map();
 let nodeDataById = new Map();
 let annotationsByNode = new Map();
@@ -32,7 +41,7 @@ const SPAN_TAGS = {
 // above) are rendered as a distinct, visibly tinted inline mark so a new
 // highlight/note/voice-note is obvious immediately, not just via the small
 // gutter dot.
-const ANN_CLASS = { highlight: 'ann-highlight', text_note: 'ann-note', voice_note: 'ann-voice' };
+const ANN_CLASS = { highlight: 'ann-highlight', text_note: 'ann-note', voice_note: 'ann-voice', search_flash: 'ann-flash' };
 
 // Wraps ranges of `content` in formatting tags per `spans` ({start, end, type,
 // href?} in Unicode-codepoint offsets — the same coordinate space the compiler
@@ -94,8 +103,8 @@ function textNodeElement(tag, node, annotations) {
   return el;
 }
 
-function renderNode(node) {
-  const annotations = annotationRanges(node.id);
+function renderNode(node, extraRanges) {
+  const annotations = annotationRanges(node.id).concat(extraRanges || []);
   const wrapper = document.createElement('div');
   wrapper.className = 'node';
   wrapper.id = `node-${node.id}`;
@@ -138,7 +147,7 @@ function renderNode(node) {
       const figure = document.createElement('figure');
       const img = document.createElement('img');
       const assetId = node.attributes && node.attributes.asset_id;
-      img.src = `weland-asset://asset/${assetId}`;
+      img.src = assetUrl(assetId);
       img.alt = (node.attributes && node.attributes.alt) || '';
       figure.appendChild(img);
       const caption = node.attributes && node.attributes.caption;
@@ -197,7 +206,7 @@ function renderAnnotationMarks(nodeWrapperEl, nodeId) {
     if (ann.annotation_type === 'voice_note' && ann.asset_id) {
       const audio = document.createElement('audio');
       audio.controls = true;
-      audio.src = `weland-asset://asset/${ann.asset_id}`;
+      audio.src = assetUrl(ann.asset_id);
       pop.appendChild(audio);
     } else if (ann.comment) {
       const p = document.createElement('div');
@@ -254,14 +263,15 @@ function renderAnnotationMarks(nodeWrapperEl, nodeId) {
 // Rebuilds a single node's DOM (text content + gutter marks) from the
 // current `annotationsByNode` state — used whenever an annotation on that
 // node is created, edited, or removed.
-function rerenderNode(nodeId) {
+function rerenderNode(nodeId, extraRanges) {
   const node = nodeDataById.get(nodeId);
   const oldWrapper = nodeElById.get(nodeId);
   if (!node || !oldWrapper) return;
-  const newWrapper = renderNode(node);
+  const newWrapper = renderNode(node, extraRanges);
   oldWrapper.replaceWith(newWrapper);
   nodeElById.set(nodeId, newWrapper);
   renderAnnotationMarks(newWrapper, nodeId);
+  refreshAnnotationsUi();
 }
 
 function removeAnnotationLocally(id, nodeId) {
@@ -400,7 +410,9 @@ function renderBook(book) {
 
   document.getElementById('emptyState').hidden = true;
   document.getElementById('appFrame').hidden = false;
+  document.getElementById('annotationsPanel').hidden = true;
   updateActiveTocEntry();
+  updateAnnotationsCount(allAnnotationsInOrder());
 }
 
 /* ================= Author name ================= */
@@ -456,22 +468,145 @@ document.getElementById('authorBtn').addEventListener('click', () => {
   }
 })();
 
-document.getElementById('openBookBtn').addEventListener('click', async () => {
+async function openBookAtPath(path) {
   const errorEl = document.getElementById('openError');
   errorEl.hidden = true;
   try {
-    const path = await dialogApi.open({
-      multiple: false,
-      filters: [{ name: 'Weland book', extensions: ['wld'] }],
-    });
-    if (!path) return;
     const book = await invoke('open_book', { path });
     renderBook(book);
   } catch (err) {
     errorEl.textContent = String(err);
     errorEl.hidden = false;
   }
+}
+
+document.getElementById('openBookBtn').addEventListener('click', async () => {
+  const path = await dialogApi.open({
+    multiple: false,
+    filters: [{ name: 'Weland book', extensions: ['wld'] }],
+  });
+  if (!path) return;
+  await openBookAtPath(path);
 });
+
+/* ================= Library ================= */
+
+let libraryBooks = [];
+
+function formatLibraryDate(epochSecs) {
+  if (!epochSecs) return '';
+  return new Date(epochSecs * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+function renderLibrary(filterText) {
+  const grid = document.getElementById('libraryGrid');
+  const emptyState = document.getElementById('libraryEmptyState');
+  const search = document.getElementById('librarySearch');
+
+  if (libraryBooks.length === 0) {
+    search.hidden = true;
+    grid.hidden = true;
+    emptyState.hidden = false;
+    emptyState.querySelector('p').textContent =
+      "Open a .wld file to start reading — it'll show up here next time you launch.";
+    return;
+  }
+
+  search.hidden = false;
+  const q = (filterText || '').toLowerCase();
+  const filtered = q
+    ? libraryBooks.filter(
+        (b) => b.title.toLowerCase().includes(q) || (b.author || '').toLowerCase().includes(q),
+      )
+    : libraryBooks;
+
+  if (filtered.length === 0) {
+    grid.hidden = true;
+    emptyState.hidden = false;
+    emptyState.querySelector('p').textContent = `No books match "${filterText}".`;
+    return;
+  }
+
+  emptyState.hidden = true;
+  grid.hidden = false;
+  grid.innerHTML = '';
+
+  for (const book of filtered) {
+    const li = document.createElement('li');
+    li.className = book.available ? 'library-card' : 'library-card library-card-missing';
+
+    const openBtn = document.createElement('button');
+    openBtn.className = 'library-card-open';
+    openBtn.disabled = !book.available;
+
+    const cover = document.createElement('span');
+    if (book.cover_data_uri) {
+      cover.className = 'library-cover';
+      cover.style.backgroundImage = `url("${book.cover_data_uri}")`;
+    } else {
+      cover.className = 'library-cover library-cover-placeholder';
+      cover.textContent = (book.title || '?').trim().charAt(0).toUpperCase();
+    }
+
+    const title = document.createElement('span');
+    title.className = 'library-title';
+    title.textContent = book.title || 'Untitled';
+
+    const author = document.createElement('span');
+    author.className = 'library-author';
+    author.textContent = book.author || '';
+
+    const meta = document.createElement('span');
+    meta.className = 'library-meta';
+    meta.textContent = book.available ? `Opened ${formatLibraryDate(book.last_opened_at)}` : 'File not found';
+
+    openBtn.append(cover, title, author, meta);
+    openBtn.addEventListener('click', () => openBookAtPath(book.path));
+
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.className = 'library-card-remove';
+    removeBtn.title = 'Remove from library';
+    removeBtn.setAttribute('aria-label', 'Remove from library');
+    removeBtn.textContent = '×';
+    removeBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      if (!confirm(`Remove "${book.title}" from your library? The file itself won't be touched.`)) return;
+      try {
+        await invoke('remove_from_library', { path: book.path });
+        libraryBooks = libraryBooks.filter((b) => b.path !== book.path);
+        renderLibrary(search.value.trim());
+      } catch (err) {
+        console.error('Failed to remove from library', err);
+      }
+    });
+
+    li.append(openBtn, removeBtn);
+    grid.appendChild(li);
+  }
+}
+
+async function loadLibrary() {
+  try {
+    libraryBooks = await invoke('list_library');
+  } catch (err) {
+    console.error('Failed to load library', err);
+    libraryBooks = [];
+  }
+  renderLibrary(document.getElementById('librarySearch').value.trim());
+}
+
+document.getElementById('librarySearch').addEventListener('input', (e) => {
+  renderLibrary(e.target.value.trim());
+});
+
+document.getElementById('libraryBtn').addEventListener('click', () => {
+  document.getElementById('appFrame').hidden = true;
+  document.getElementById('emptyState').hidden = false;
+  loadLibrary();
+});
+
+loadLibrary();
 
 /* ================= Search ================= */
 
@@ -505,7 +640,52 @@ async function runSearch(query) {
   }
 }
 
+// Finds the first case-insensitive occurrence of `term` in `content`, in the
+// same Unicode-codepoint offset space as span/annotation offsets.
+function findCodepointRange(content, term) {
+  const chars = Array.from(content || '');
+  const termChars = Array.from(term || '');
+  if (termChars.length === 0) return null;
+  const lower = chars.map((c) => c.toLowerCase());
+  const termLower = termChars.map((c) => c.toLowerCase());
+  outer: for (let i = 0; i <= lower.length - termLower.length; i++) {
+    for (let j = 0; j < termLower.length; j++) {
+      if (lower[i + j] !== termLower[j]) continue outer;
+    }
+    return { start: i, end: i + termLower.length };
+  }
+  return null;
+}
+
+// FTS5 snippet() wraps each matched term in «» — pull those back out so we
+// can locate the same text in the node's actual content.
+function extractMatchTerms(snippet) {
+  const terms = [];
+  const re = /«([^»]+)»/g;
+  let m;
+  while ((m = re.exec(snippet || ''))) terms.push(m[1]);
+  return terms;
+}
+
+let flashTimeout = null;
+
+function flashSearchMatch(nodeId, terms) {
+  const node = nodeDataById.get(nodeId);
+  if (!node) return;
+  let range = null;
+  for (const term of terms) {
+    range = findCodepointRange(node.content, term);
+    if (range) break;
+  }
+  if (!range) return;
+
+  clearTimeout(flashTimeout);
+  rerenderNode(nodeId, [{ start: range.start, end: range.end, annotation_type: 'search_flash', id: 'search-flash' }]);
+  flashTimeout = setTimeout(() => rerenderNode(nodeId), 2200);
+}
+
 function renderSearchResults(query, hits) {
+  document.getElementById('annotationsPanel').hidden = true;
   const panel = document.getElementById('searchResults');
   const list = document.getElementById('searchResultsList');
   document.getElementById('searchResultsTitle').textContent =
@@ -519,6 +699,7 @@ function renderSearchResults(query, hits) {
     btn.innerHTML = `<span class="sr-type">${escapeHtml(hit.node_type)}</span>${snippetHtml}`;
     btn.addEventListener('click', () => {
       jumpToNode(hit.node_id);
+      flashSearchMatch(hit.node_id, extractMatchTerms(hit.snippet));
       panel.hidden = true;
     });
     li.appendChild(btn);
@@ -529,6 +710,89 @@ function renderSearchResults(query, hits) {
 
 document.getElementById('closeSearchResults').addEventListener('click', () => {
   document.getElementById('searchResults').hidden = true;
+});
+
+/* ================= Annotations panel ================= */
+
+function annotationSnippet(ann) {
+  if (ann.comment) return ann.comment;
+  if (ann.selected_text) return `"${ann.selected_text}"`;
+  return '(recorded note)';
+}
+
+function allAnnotationsInOrder() {
+  if (!currentBook) return [];
+  const out = [];
+  for (const node of currentBook.nodes) {
+    const anns = annotationsByNode.get(node.id) || [];
+    for (const ann of [...anns].sort((a, b) => a.start_offset - b.start_offset)) {
+      out.push(ann);
+    }
+  }
+  return out;
+}
+
+function updateAnnotationsCount(anns) {
+  const badge = document.getElementById('annotationsCount');
+  badge.textContent = String(anns.length);
+  badge.hidden = anns.length === 0;
+}
+
+function renderAnnotationsPanel() {
+  const anns = allAnnotationsInOrder();
+  updateAnnotationsCount(anns);
+
+  const panel = document.getElementById('annotationsPanel');
+  const list = document.getElementById('annotationsList');
+  document.getElementById('annotationsPanelTitle').textContent =
+    `${anns.length} annotation${anns.length === 1 ? '' : 's'}`;
+  list.innerHTML = '';
+
+  if (anns.length === 0) {
+    const li = document.createElement('li');
+    li.className = 'ann-empty';
+    li.textContent = 'No annotations yet — select some text to add one.';
+    list.appendChild(li);
+    return;
+  }
+
+  for (const ann of anns) {
+    const li = document.createElement('li');
+    const btn = document.createElement('button');
+    const date = (ann.created_at || '').slice(0, 10);
+    btn.innerHTML = `<span class="sr-type">${escapeHtml(KIND_LABELS[ann.annotation_type] || 'Annotation')}</span>` +
+      `<span class="ann-snippet">${escapeHtml(annotationSnippet(ann))}</span>` +
+      `<span class="ann-meta">${escapeHtml(ann.author_name)}${date ? ` · ${escapeHtml(date)}` : ''}</span>`;
+    btn.addEventListener('click', () => {
+      jumpToNode(ann.node_id);
+      panel.hidden = true;
+    });
+    li.appendChild(btn);
+    list.appendChild(li);
+  }
+}
+
+// Refreshes the titlebar count and (if the panel is currently open) its
+// contents. Called from rerenderNode(), which every annotation create /
+// edit / delete path already funnels through.
+function refreshAnnotationsUi() {
+  updateAnnotationsCount(allAnnotationsInOrder());
+  if (!document.getElementById('annotationsPanel').hidden) renderAnnotationsPanel();
+}
+
+document.getElementById('annotationsBtn').addEventListener('click', () => {
+  const panel = document.getElementById('annotationsPanel');
+  if (panel.hidden) {
+    document.getElementById('searchResults').hidden = true;
+    renderAnnotationsPanel();
+    panel.hidden = false;
+  } else {
+    panel.hidden = true;
+  }
+});
+
+document.getElementById('closeAnnotationsPanel').addEventListener('click', () => {
+  document.getElementById('annotationsPanel').hidden = true;
 });
 
 /* ================= Day / night reading mode ================= */
