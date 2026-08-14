@@ -1,4 +1,5 @@
 pub mod compiler;
+pub mod db;
 pub mod dom;
 pub mod epub;
 pub mod schema;

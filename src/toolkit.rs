@@ -1,12 +1,12 @@
 use anyhow::{anyhow, Context, Result};
 use colored::*;
 use rusqlite::{params, Connection};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use crate::schema::{AstNode, Span};
+use crate::db;
+use crate::schema::Span;
 
 /// Export format types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,16 +26,11 @@ pub fn inspect_wld<P: AsRef<Path>>(wld_path: P) -> Result<()> {
 
     // 1. Metadata
     println!("\n{}", "--- Metadata ---".bold());
-    let mut stmt = conn.prepare("SELECT key, value FROM metadata ORDER BY key")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-
-    let mut metadata_map = HashMap::new();
-    for row in rows {
-        let (k, v) = row?;
-        println!("  {}: {}", k.dimmed(), v.bold());
-        metadata_map.insert(k, v);
+    let metadata_map = db::load_metadata(&conn)?;
+    let mut keys: Vec<&String> = metadata_map.keys().collect();
+    keys.sort();
+    for k in keys {
+        println!("  {}: {}", k.dimmed(), metadata_map[k].bold());
     }
 
     // 2. Node Counts by Type
@@ -85,23 +80,7 @@ pub fn inspect_wld<P: AsRef<Path>>(wld_path: P) -> Result<()> {
 
     // 6. Table of Contents
     println!("\n{}", "--- Table of Contents ---".bold());
-    let mut stmt = conn.prepare(
-        "SELECT id, parent_id, ordinal, title, target_node_id, href
-         FROM table_of_contents ORDER BY ordinal ASC",
-    )?;
-
-    let toc_entries: Vec<crate::schema::TocEntry> = stmt
-        .query_map([], |row| {
-            Ok(crate::schema::TocEntry {
-                id: row.get(0)?,
-                parent_id: row.get(1)?,
-                ordinal: row.get(2)?,
-                title: row.get(3)?,
-                target_node_id: row.get(4)?,
-                href: row.get(5)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let toc_entries = db::load_toc(&conn)?;
 
     if toc_entries.is_empty() {
         println!("  (No TOC entries found)");
@@ -143,37 +122,20 @@ pub fn search_wld<P: AsRef<Path>>(wld_path: P, query: &str, limit: usize) -> Res
     let conn = Connection::open(path)
         .with_context(|| format!("Failed to open Weland database at: {}", path.display()))?;
 
-    let mut stmt = conn.prepare(
-        "SELECT a.id, a.ordinal, a.node_type, snippet(fts_nodes, 0, '«', '»', '...', 12) as snip
-         FROM fts_nodes
-         JOIN ast_nodes a ON a.id = fts_nodes.rowid
-         WHERE fts_nodes MATCH ?1
-         ORDER BY rank
-         LIMIT ?2",
-    )?;
-
-    let matches = stmt.query_map(params![query, limit as i64], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
+    let hits = db::search_nodes(&conn, query, limit)?;
 
     println!("{}", format!("=== Search Results for \"{}\" in {} ===", query, path.display()).bold().cyan());
 
     let mut count = 0;
-    for m in matches {
+    for hit in &hits {
         count += 1;
-        let (id, ordinal, ntype, snippet) = m?;
         println!(
             "[{}] Ordinal #{} ({}) | Node ID: {}\n  {}",
             count.to_string().yellow(),
-            ordinal,
-            ntype.dimmed(),
-            id,
-            snippet.bright_white()
+            hit.ordinal,
+            hit.node_type.dimmed(),
+            hit.node_id,
+            hit.snippet.bright_white()
         );
     }
 
@@ -344,23 +306,7 @@ pub fn export_wld<P: AsRef<Path>, Q: AsRef<Path>>(
         .with_context(|| format!("Failed to open Weland database at: {}", path.display()))?;
 
     // Load nodes ordered by ordinal
-    let mut stmt = conn.prepare(
-        "SELECT id, parent_id, ordinal, node_type, content, attributes
-         FROM ast_nodes ORDER BY ordinal ASC",
-    )?;
-
-    let nodes = stmt.query_map([], |row| {
-        let attr_str: Option<String> = row.get(5)?;
-        let attr_val = attr_str.and_then(|s| serde_json::from_str::<Value>(&s).ok());
-        Ok(AstNode {
-            id: row.get(0)?,
-            parent_id: row.get(1)?,
-            ordinal: row.get(2)?,
-            node_type: row.get(3)?,
-            content: row.get(4)?,
-            attributes: attr_val,
-        })
-    })?.collect::<std::result::Result<Vec<_>, _>>()?;
+    let nodes = db::load_ast_nodes(&conn)?;
 
     let exported_text = match format {
         ExportFormat::Json => {

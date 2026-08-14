@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Weland Reader</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <!-- ============ Empty state: no book open yet ============ -->
+  <div id="emptyState" class="empty-state">
+    <div class="empty-card">
+      <h1>Weland Reader</h1>
+      <p>Open a <code>.wld</code> file to start reading.</p>
+      <button id="openBookBtn" class="btn-primary">Open a book…</button>
+      <p id="openError" class="open-error" hidden></p>
+    </div>
+  </div>
+
+  <!-- ============ App shell ============ -->
+  <div id="appFrame" class="app-frame" hidden>
+    <div class="app-titlebar">
+      <div class="tb-left">
+        <span class="tb-title" id="bookTitle">—</span>
+        <span class="tb-byline" id="bookByline"></span>
+      </div>
+      <div class="tb-search">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.6" y2="16.6"/></svg>
+        <input type="text" id="searchInput" placeholder="Search this book…" aria-label="Search this book" />
+      </div>
+      <div class="tb-right">
+        <span class="tb-pill">FTS5 indexed</span>
+        <button class="mode-toggle" id="modeToggle" aria-label="Toggle day / night reading mode" title="Day / night reading mode">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8Z"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="app-body">
+      <nav class="toc" aria-label="Table of contents">
+        <h2>Contents</h2>
+        <ol id="tocList"></ol>
+      </nav>
+
+      <main class="reading-pane" id="readingPane">
+        <article id="readingArticle"></article>
+      </main>
+
+      <aside class="search-results" id="searchResults" hidden>
+        <div class="sr-header">
+          <span id="searchResultsTitle"></span>
+          <button id="closeSearchResults" aria-label="Close search results">&times;</button>
+        </div>
+        <ol id="searchResultsList"></ol>
+      </aside>
+    </div>
+  </div>
+
+  <!-- ============ Floating selection toolbar (Highlight / Note / Record) ============ -->
+  <div id="selectionToolbar" class="selection-toolbar" hidden>
+    <button data-action="highlight">Highlight</button>
+    <button data-action="note">Note</button>
+    <button data-action="record">Record</button>
+  </div>
+
+  <!-- ============ Note composer popover ============ -->
+  <div id="noteComposer" class="note-composer" hidden>
+    <textarea id="noteText" placeholder="Add a note…" rows="3"></textarea>
+    <div class="note-composer-actions">
+      <button id="noteCancel">Cancel</button>
+      <button id="noteSave" class="btn-primary">Save</button>
+    </div>
+  </div>
+
+  <!-- ============ Floating voice recorder pill ============ -->
+  <div id="voicePill" class="voice-pill" hidden>
+    <span class="rec-dot" aria-hidden="true"></span>
+    <span class="waveform" aria-hidden="true">
+      <span></span><span></span><span></span><span></span><span></span><span></span>
+    </span>
+    <span class="rec-label">Recording…</span>
+    <span class="rec-time" id="recTime">0:00</span>
+    <button class="stop-btn" id="stopRecordingBtn" aria-label="Stop recording"><span></span></button>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
