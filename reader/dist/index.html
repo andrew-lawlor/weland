@@ -23,7 +23,7 @@
 
     <div id="libraryEmptyState" class="library-empty">
       <img id="libraryEmptyGif" class="library-empty-gif" src="forge-anvil.gif" alt="" />
-      <p>Open a <code>.wld</code> file to start reading — it'll show up here next time you launch.</p>
+      <p>Open a <code>.wld</code> or <code>.epub</code> file to start reading — it'll show up here next time you launch.</p>
     </div>
 
     <ol id="libraryGrid" class="library-grid" hidden></ol>
@@ -138,6 +138,14 @@
         <span id="tsLeadingValue"></span>
         <button type="button" id="tsLeadingUp" aria-label="Increase line spacing">+</button>
       </div>
+    </div>
+  </div>
+
+  <!-- ============ Compiling overlay (EPUB import) ============ -->
+  <div id="compilingOverlay" class="compiling-overlay" hidden>
+    <div class="compiling-card">
+      <img src="forge-anvil.gif" alt="" />
+      <p>Forging your book…</p>
     </div>
   </div>
 

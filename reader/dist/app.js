@@ -391,7 +391,12 @@ function updateActiveTocEntry() {
   const pane = document.getElementById('readingPane');
   const threshold = pane.getBoundingClientRect().top + 96;
 
-  let current = tocTargets[0];
+  // Starts at "none" rather than defaulting to the first TOC target — a book's
+  // own TOC/nav often skips un-headed front matter (title page, copyright),
+  // so sitting at the very top, before that first entry, is a real state
+  // that deserves no highlight, not the first entry lit up as if we'd
+  // already reached it.
+  let current = null;
   for (const target of tocTargets) {
     if (!target.el) continue;
     if (target.el.getBoundingClientRect().top <= threshold) {
@@ -401,9 +406,10 @@ function updateActiveTocEntry() {
     }
   }
 
-  if (current.nodeId === activeTocNodeId) return;
-  activeTocNodeId = current.nodeId;
-  const link = tocLinkByNodeId.get(current.nodeId);
+  const newActiveId = current ? current.nodeId : null;
+  if (newActiveId === activeTocNodeId) return;
+  activeTocNodeId = newActiveId;
+  const link = current ? tocLinkByNodeId.get(current.nodeId) : null;
   setActiveTocLink(link);
   if (link) link.scrollIntoView({ block: 'nearest' });
 }
@@ -573,13 +579,56 @@ async function openBookAtPath(path) {
   }
 }
 
+function setCompilingOverlay(visible) {
+  document.getElementById('compilingOverlay').hidden = !visible;
+}
+
+// Compiles an EPUB (via the same compiler the CLI uses) and opens the
+// result. If writing to the default location (next to the source file)
+// fails — read-only folder, no permission, etc. — offers a save dialog to
+// pick somewhere else and retries there.
+function nextPaint() {
+  return new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+}
+
+async function importEpub(inputPath, outputPath) {
+  const errorEl = document.getElementById('openError');
+  errorEl.hidden = true;
+  setCompilingOverlay(true);
+  // Force the overlay to actually paint before the (heavy) compile call starts.
+  await nextPaint();
+  try {
+    const book = await invoke('import_epub', { inputPath, outputPath: outputPath || null });
+    setCompilingOverlay(false);
+    renderBook(book);
+  } catch (err) {
+    setCompilingOverlay(false);
+    if (!outputPath) {
+      const retryPath = await dialogApi.save({
+        defaultPath: inputPath.replace(/\.epub$/i, '.wld'),
+        filters: [{ name: 'Weland book', extensions: ['wld'] }],
+      });
+      if (retryPath) {
+        await importEpub(inputPath, retryPath);
+        return;
+      }
+    }
+    errorEl.textContent = String(err);
+    errorEl.hidden = false;
+  }
+}
+
 document.getElementById('openBookBtn').addEventListener('click', async () => {
   const path = await dialogApi.open({
     multiple: false,
-    filters: [{ name: 'Weland book', extensions: ['wld'] }],
+    filters: [{ name: 'Book (.wld or .epub)', extensions: ['wld', 'epub'] }],
   });
   if (!path) return;
-  await openBookAtPath(path);
+  if (path.toLowerCase().endsWith('.epub')) {
+    await importEpub(path);
+  } else {
+    await openBookAtPath(path);
+  }
 });
 
 /* ================= Library ================= */
@@ -602,7 +651,7 @@ function renderLibrary(filterText) {
     emptyState.hidden = false;
     document.getElementById('libraryEmptyGif').hidden = false;
     emptyState.querySelector('p').textContent =
-      "Open a .wld file to start reading — it'll show up here next time you launch.";
+      "Open a .wld or .epub file to start reading — it'll show up here next time you launch.";
     return;
   }
 

@@ -1,8 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use weland::compiler::{compile_epub, CompileOptions};
+use weland::compiler::{compile_epub, default_wld_output_path, CompileOptions};
 use weland::toolkit::{export_wld, extract_assets, inspect_wld, search_wld, ExportFormat};
 
 #[derive(Parser, Debug)]
@@ -118,14 +118,6 @@ impl From<CliExportFormat> for ExportFormat {
     }
 }
 
-fn derive_default_output(input: &Path) -> PathBuf {
-    let stem = input.file_stem().unwrap_or_default();
-    let mut out = input.to_path_buf();
-    out.set_file_name(stem);
-    out.set_extension("wld");
-    out
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let options = CompileOptions {
@@ -135,7 +127,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Some(Commands::Compile { input, output }) => {
-            let out = output.unwrap_or_else(|| derive_default_output(&input));
+            let out = output.unwrap_or_else(|| default_wld_output_path(&input));
             compile_epub(&input, &out, &options)?;
         }
         Some(Commands::Inspect { file }) => {
@@ -152,7 +144,7 @@ fn main() -> Result<()> {
         }
         None => {
             if let Some(input) = cli.direct_input {
-                let out = cli.direct_output.unwrap_or_else(|| derive_default_output(&input));
+                let out = cli.direct_output.unwrap_or_else(|| default_wld_output_path(&input));
                 compile_epub(&input, &out, &options)?;
             } else {
                 eprintln!(

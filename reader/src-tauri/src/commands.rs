@@ -5,6 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager, State};
 
+use weland::compiler::{compile_epub, default_wld_output_path, CompileOptions};
 use weland::db::{self, NewAnnotation, SearchHit};
 use weland::schema::{AstNode, TocEntry, UserAnnotation};
 
@@ -49,6 +50,52 @@ pub fn open_book(path: String, state: State<AppState>, app: AppHandle) -> Result
     *state.db.lock().map_err(|e| e.to_string())? = Some(conn);
 
     Ok(BookPayload { path, metadata, toc, nodes, annotations, last_position_node_id })
+}
+
+// Compiles an EPUB to .wld (via the same compiler the CLI uses) and opens it,
+// reusing open_book entirely for the load/library-bookkeeping step.
+//
+// `output_path` lets the frontend retry at a caller-chosen location (e.g. via
+// a save dialog) if the default adjacent-to-the-source path isn't writable.
+// If a .wld already exists at the target path, compiling is skipped and it's
+// opened as-is — silently recompiling would blow away any annotations
+// already stored in it.
+//
+// Declared async and runs the actual compile via spawn_blocking: this is a
+// genuinely CPU/IO-heavy synchronous call (HTML parsing, asset extraction,
+// FTS indexing), and running it as a plain sync command left the UI frozen
+// with no chance to paint the "compiling" overlay first.
+#[tauri::command]
+pub async fn import_epub(
+    input_path: String,
+    output_path: Option<String>,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<BookPayload, String> {
+    let input = std::path::Path::new(&input_path).to_path_buf();
+    let output = match output_path {
+        Some(p) => PathBuf::from(p),
+        None => default_wld_output_path(&input),
+    };
+
+    if !output.exists() {
+        let compile_target = output.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let options = CompileOptions { quiet: true, verbose: false };
+            compile_epub(&input, &compile_target, &options)
+        })
+        .await
+        .map_err(|e| format!("Compile task failed: {e}"))?
+        .map_err(|e| format!("Failed to compile {input_path}: {e}"))?;
+
+        // A freshly compiled file has no reading history, even if it happens to
+        // land at a path a since-deleted .wld previously occupied — otherwise
+        // whatever position was saved there before gets restored into content
+        // that (from the reader's perspective) was just opened for the first time.
+        clear_last_position(&app, &output.to_string_lossy());
+    }
+
+    open_book(output.to_string_lossy().to_string(), state, app)
 }
 
 #[tauri::command]
@@ -338,6 +385,15 @@ fn find_last_position(app: &AppHandle, path: &str) -> Option<i64> {
         .into_iter()
         .find(|e| e.path == path)?
         .last_position_node_id
+}
+
+fn clear_last_position(app: &AppHandle, path: &str) {
+    if let Ok(mut entries) = read_library(app) {
+        if let Some(existing) = entries.iter_mut().find(|e| e.path == path) {
+            existing.last_position_node_id = None;
+            let _ = write_library(app, &entries);
+        }
+    }
 }
 
 #[tauri::command]

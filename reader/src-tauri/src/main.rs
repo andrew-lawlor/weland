@@ -57,6 +57,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::open_book,
+            commands::import_epub,
             commands::search_book,
             commands::create_highlight,
             commands::create_text_note,

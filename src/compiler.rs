@@ -19,6 +19,17 @@ pub struct CompileOptions {
     pub verbose: bool,
 }
 
+/// The default `.wld` output path for a given input file: same directory,
+/// same stem, `.wld` extension. Shared by the CLI and the reader app's
+/// in-app EPUB import so both derive the exact same path.
+pub fn default_wld_output_path(input: &Path) -> std::path::PathBuf {
+    let stem = input.file_stem().unwrap_or_default();
+    let mut out = input.to_path_buf();
+    out.set_file_name(stem);
+    out.set_extension("wld");
+    out
+}
+
 /// Statistics returned after successful compilation.
 #[derive(Debug, Clone, Default)]
 pub struct CompileStats {
