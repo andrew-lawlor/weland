@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod dictionary;
 
 use rusqlite::Connection;
 use std::sync::Mutex;
@@ -8,6 +9,7 @@ use tauri::{Manager, State};
 
 pub struct AppState {
     pub db: Mutex<Option<Connection>>,
+    pub dict_db: Mutex<Option<Connection>>,
 }
 
 fn asset_response(mime: String, data: Vec<u8>) -> tauri::http::Response<Vec<u8>> {
@@ -31,7 +33,7 @@ fn not_found() -> tauri::http::Response<Vec<u8>> {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(AppState { db: Mutex::new(None) })
+        .manage(AppState { db: Mutex::new(None), dict_db: Mutex::new(None) })
         .register_uri_scheme_protocol("weland-asset", |ctx, request| {
             let app = ctx.app_handle();
             let state: State<AppState> = app.state();
@@ -71,6 +73,8 @@ fn main() {
             commands::get_reading_settings,
             commands::set_reading_settings,
             commands::update_reading_position,
+            dictionary::lookup_word,
+            dictionary::lookup_word_online,
         ])
         .run(tauri::generate_context!())
         .expect("error while running weland-reader");

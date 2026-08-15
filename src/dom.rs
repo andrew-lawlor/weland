@@ -19,12 +19,22 @@ pub enum ChapterElement {
         element_id: Option<String>,
     },
     Paragraph {
-        node_type: String, // "paragraph", "blockquote", "list"
+        node_type: String, // "paragraph", "blockquote", "verse_line"
         text: String,
         spans: Vec<Span>,
         source_file: String,
         footnotes: Vec<FootnoteRef>,
         element_id: Option<String>,
+        // Only meaningful for "verse_line": true if this line starts a new
+        // stanza (its <p> has a different parent than the previous verse
+        // line's), so the reader can add breathing room between stanzas
+        // without also spacing out every line within one.
+        stanza_start: bool,
+        // Only meaningful for "verse_line": true if this is the last line
+        // of its verse run, so the reader can restore the gap before
+        // whatever (usually prose) comes next — verse lines are otherwise
+        // zero-margin for tight in-stanza spacing.
+        verse_end: bool,
     },
     ThematicBreak {
         element_id: Option<String>,
@@ -298,6 +308,18 @@ impl TextCollector {
         }
     }
 
+    /// Inserts an explicit line break (from `<br>`), replacing any pending
+    /// collapsed space rather than emitting both. A no-op before any content
+    /// or immediately after another break, so consecutive `<br><br>` (or a
+    /// `<br>` right at the start) doesn't stack up blank lines.
+    fn feed_line_break(&mut self) {
+        self.pending_space = false;
+        if self.chars.is_empty() || self.chars.last() == Some(&'\n') {
+            return;
+        }
+        self.chars.push('\n');
+    }
+
     /// Converts the collected characters to a String and returns the final length.
     fn finish(mut self) -> (String, usize) {
         // Trim trailing space if any
@@ -347,6 +369,15 @@ fn extract_text_and_spans_opts(element: ElementRef, stop_at_lists: bool) -> Text
                     let tag = el_data.name().to_lowercase();
 
                     if stop_at_lists && (tag == "ul" || tag == "ol") {
+                        continue;
+                    }
+
+                    // <br> was previously a silent no-op (dropped entirely) —
+                    // the common single-paragraph-per-stanza convention for
+                    // verse/addresses/lyrics (lines separated by <br> inside
+                    // one <p>) collapsed into one run-on line-wrapped blob.
+                    if tag == "br" {
+                        collector.feed_line_break();
                         continue;
                     }
 
@@ -468,6 +499,193 @@ fn extract_text_and_spans_opts(element: ElementRef, stop_at_lists: bool) -> Text
     }
 }
 
+/// Some EPUBs (e.g. this book's publisher) mark up verse as one `<p>` per
+/// line with no distinguishing class name or semantic marker at all — just
+/// generic classes shared with ordinary prose paragraphs. There's no
+/// reliable markup signal in that case, only a structural one: verse lines
+/// run much shorter than prose paragraphs, and cluster together. Detects
+/// maximal runs of short, verse-*candidate* `<p>`s at least `MIN_RUN` long
+/// (long enough that it's very unlikely to just be a couple of short
+/// ordinary sentences) and flags them all as verse — regardless of which
+/// `<div>` groups them, since a single poem commonly spans several
+/// differently-parented stanza wrappers.
+///
+/// Short length alone is a weak signal on its own — a Table of Contents
+/// page and a run of quick dialogue are also runs of short `<p>`s, and were
+/// getting misdetected as verse before the disqualifying signals below were
+/// added. But a single disqualifying line can't be allowed to reject it
+/// *outright* either — a poem is free to quote a character speaking
+/// mid-stanza, and that opening-quote line shouldn't fall out of the run
+/// and read as an out-of-place paragraph next to lines that are otherwise
+/// clearly verse. So the boundary of a candidate run is decided by length
+/// alone; whether the run as a whole gets accepted as verse is a separate
+/// question, decided by what *fraction* of it is disqualifying (a run of
+/// dialogue or Contents entries is disqualifying almost line for line; a
+/// poem with one quoted line in it is not). Returns, indexed by the Nth
+/// `<p>` encountered in document order (same order and same "every <p>
+/// counts" rule the caller in `parse_chapter_html` uses to walk them in
+/// lockstep): (is this line verse, does it start a new stanza).
+fn detect_verse_paragraphs(body: ElementRef) -> (Vec<bool>, Vec<bool>, Vec<bool>) {
+    const SHORT_LEN: usize = 60;
+    const MIN_RUN: usize = 3;
+
+    let p_selector = Selector::parse("p").unwrap();
+
+    struct Entry<'a> {
+        parent: Option<ElementRef<'a>>,
+        is_short: bool,
+        // A <p> wrapping nothing but e.g. a decorative section-break image
+        // (`<p class="image"><img .../></p>`) — real content contributes
+        // no text at all. Transparent for run/stanza purposes: it neither
+        // breaks a verse run nor counts as a parent/stanza boundary, same
+        // as it would if it weren't a <p> at all (most publishers put such
+        // images directly in the flow, not wrapped in a <p>; this one
+        // does, so it still needs an entry here to keep index alignment
+        // with the caller's own "every <p> counts" counter).
+        is_empty: bool,
+        // Looks like dialogue (opens with a quotation mark) or a Contents
+        // entry (one whole-line hyperlink) — a signal against the *run*
+        // being verse at all, not grounds to drop this one line from an
+        // otherwise-clearly-verse run.
+        is_disqualifying: bool,
+        starts_with_number: bool,
+    }
+
+    let entries: Vec<Entry> = body
+        .select(&p_selector)
+        .map(|p| {
+            let TextAndSpans { text, spans } = extract_text_and_spans(p);
+            let len = text.chars().count();
+            Entry {
+                parent: p.parent().and_then(ElementRef::wrap),
+                is_short: len > 0 && len <= SHORT_LEN,
+                is_empty: len == 0,
+                is_disqualifying: starts_with_opening_quote(&text) || is_whole_line_link(len, &spans),
+                starts_with_number: leading_number_len(&text).is_some(),
+            }
+        })
+        .collect();
+
+    let mut is_verse = vec![false; entries.len()];
+    let mut is_stanza_start = vec![false; entries.len()];
+    let mut is_verse_end = vec![false; entries.len()];
+
+    let mut i = 0;
+    while i < entries.len() {
+        if entries[i].is_short {
+            let start = i;
+            let mut j = i;
+            // An empty entry (e.g. a <p> wrapping only a decorative image)
+            // doesn't break the run — look through it, same as if it
+            // weren't a <p> at all.
+            while j < entries.len() && (entries[j].is_short || entries[j].is_empty) {
+                j += 1;
+            }
+            let short_count = entries[start..j].iter().filter(|e| e.is_short).count();
+            let disqualified_count =
+                entries[start..j].iter().filter(|e| e.is_short && e.is_disqualifying).count();
+            if short_count >= MIN_RUN && disqualified_count * 2 < short_count {
+                for k in start..j {
+                    if entries[k].is_short {
+                        is_verse[k] = true;
+                    }
+                }
+                // Every verse_line gets margin: 0 for tight in-stanza
+                // spacing (see styles.css), which also zeroes out the gap
+                // after the run's last line — mark it so the reader can
+                // restore breathing room before whatever (usually prose)
+                // comes next.
+                if let Some(last_short) = (start..j).rev().find(|&k| entries[k].is_short) {
+                    is_verse_end[last_short] = true;
+                }
+                // Two independent stanza-boundary signals, since publishers
+                // vary: some wrap each stanza in its own element (parent
+                // changes at the boundary — this book's "raven" passage
+                // does this), others run every stanza flat with no wrapper
+                // at all and only mark the boundary with a leading stanza
+                // number on the line itself (this book's Völuspá does
+                // this, in the very same file). Either one, alone, is
+                // enough to call it a new stanza — except a parent change
+                // right after a group of just one line, which is more
+                // often a markup artifact (e.g. a decorative section-break
+                // image forcing an isolated line into its own wrapper
+                // between two real stanzas, as in The Odyssey) than an
+                // actual one-line stanza. A leading number is unaffected by
+                // this — it's independently reliable regardless of group size.
+                // Empty entries are skipped entirely here too, so they
+                // can't masquerade as a stanza boundary on their own.
+                let mut last_parent = None;
+                let mut group_len = 0usize;
+                for k in start..j {
+                    if !entries[k].is_short {
+                        continue;
+                    }
+                    let parent_changed = entries[k].parent != last_parent;
+                    if parent_changed {
+                        let previous_group_was_real_stanza = group_len >= 2;
+                        if k == start || previous_group_was_real_stanza || entries[k].starts_with_number {
+                            is_stanza_start[k] = true;
+                        }
+                        group_len = 0;
+                    } else if entries[k].starts_with_number {
+                        is_stanza_start[k] = true;
+                    }
+                    group_len += 1;
+                    last_parent = entries[k].parent;
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+
+    (is_verse, is_stanza_start, is_verse_end)
+}
+
+/// True if `text` opens with a quotation mark — i.e. this paragraph is
+/// dialogue, not a candidate verse line. Checks straight and the common
+/// curly/typographic quote characters (single and double) in either
+/// direction, since EPUBs vary.
+fn starts_with_opening_quote(text: &str) -> bool {
+    matches!(
+        text.chars().next(),
+        Some('"' | '\'' | '\u{2018}' | '\u{2019}' | '\u{201C}' | '\u{201D}' | '\u{00AB}' | '\u{00BB}')
+    )
+}
+
+/// True if this paragraph's entire text is covered by a single `link` span
+/// — i.e. it's one whole-line hyperlink, like a Table of Contents entry
+/// (`<p><a href="...">Chapter 1: ...</a></p>`), not a candidate verse line.
+fn is_whole_line_link(text_len: usize, spans: &[Span]) -> bool {
+    text_len > 0
+        && spans
+            .iter()
+            .any(|s| s.span_type == "link" && s.start == 0 && s.end >= text_len)
+}
+
+/// If `text` opens with a short (1-4 digit) number, returns its character
+/// length — the common way numbered-stanza verse marks where a new stanza
+/// begins (e.g. "8 They played games in the grass,"), independent of
+/// whatever element wraps it. Also used to carve that number off into its
+/// own span so the reader can style it distinctly from the verse text.
+fn leading_number_len(text: &str) -> Option<usize> {
+    let digit_count = text.chars().take_while(|c| c.is_ascii_digit()).count();
+    (1..=4).contains(&digit_count).then_some(digit_count)
+}
+
+/// If `text` ends with a short (1-4 digit) number, returns its character
+/// length — classical verse translations commonly gutter-mark every Nth
+/// line with its running line number (e.g. "...for our modern times.10"),
+/// often glued directly onto the line with no separating space. Used to
+/// carve that number off into its own span, same idea as
+/// `leading_number_len` for stanza numbers, so it reads as a marker instead
+/// of a typo stuck to the last word.
+fn trailing_number_len(text: &str) -> Option<usize> {
+    let digit_count = text.chars().rev().take_while(|c| c.is_ascii_digit()).count();
+    (1..=4).contains(&digit_count).then_some(digit_count)
+}
+
 /// True if `elem` sits inside some other list's `<li>` — i.e. it's a sublist,
 /// not a top-level list in its own right.
 fn is_nested_in_list_item(elem: ElementRef) -> bool {
@@ -522,11 +740,62 @@ fn build_list_items(list_elem: ElementRef) -> Vec<ListItem> {
 }
 
 /// Parses an HTML/XHTML chapter document into a structured list of ChapterElements.
+/// Removes `<span epub:type="pagebreak" ...>` print-pagination markers from
+/// the raw HTML text before it's parsed — both the self-closing form
+/// (`<span .../>`) and the paired form with a short visible page number
+/// inside (`<span ...>{126}</span>`).
+///
+/// This has to happen here, on the raw text, rather than by walking the
+/// parsed DOM and skipping matching elements: `span` isn't a "void" HTML
+/// element, so html5ever (via `scraper`) doesn't honor the `/>`
+/// self-closing syntax on it — `<span .../>` parses as an *unclosed
+/// opening* tag, and every real word of text that followed it in the
+/// source becomes its child, all the way to the end of the enclosing
+/// paragraph. An element-level "skip this node" check then silently
+/// discarded that swallowed real content along with the marker (this
+/// exact bug shipped once already). Stripping the marker out of the raw
+/// text first means that malformed tree never gets built in the first
+/// place.
+fn strip_pagebreak_markers(html: &str) -> String {
+    const NEEDLE: &str = "epub:type=\"pagebreak";
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+
+    while let Some(tag_start) = rest.find("<span") {
+        let Some(tag_end_rel) = rest[tag_start..].find('>') else {
+            break;
+        };
+        let tag_end = tag_start + tag_end_rel;
+        let tag_text = &rest[tag_start..=tag_end];
+
+        if !tag_text.contains(NEEDLE) {
+            out.push_str(&rest[..=tag_end]);
+            rest = &rest[tag_end + 1..];
+            continue;
+        }
+
+        out.push_str(&rest[..tag_start]);
+        let self_closing = tag_text[..tag_text.len() - 1].trim_end().ends_with('/');
+        rest = if self_closing {
+            &rest[tag_end + 1..]
+        } else if let Some(close_rel) = rest[tag_end + 1..].find("</span>") {
+            &rest[tag_end + 1 + close_rel + "</span>".len()..]
+        } else {
+            // No closing tag at all — drop only up through here rather
+            // than risk swallowing the rest of the document defensively.
+            &rest[tag_end + 1..]
+        };
+    }
+    out.push_str(rest);
+    out
+}
+
 pub fn parse_chapter_html(
     html_content: &str,
     chapter_path: &str,
 ) -> (Html, Vec<ChapterElement>) {
-    let document = Html::parse_document(html_content);
+    let cleaned = strip_pagebreak_markers(html_content);
+    let document = Html::parse_document(&cleaned);
 
     let body_selector = Selector::parse("body").unwrap();
     let body = match document.select(&body_selector).next() {
@@ -539,6 +808,8 @@ pub fn parse_chapter_html(
     ).unwrap();
 
     let mut elements = Vec::new();
+    let (verse_flags, stanza_start_flags, verse_end_flags) = detect_verse_paragraphs(body);
+    let mut p_index = 0;
 
     for elem in body.select(&element_selector) {
         let tag = elem.value().name().to_lowercase();
@@ -650,14 +921,60 @@ pub fn parse_chapter_html(
             continue;
         }
 
-        // 6. Paragraphs, Blockquotes
-        let TextAndSpans { text, spans } = extract_text_and_spans(elem);
+        // 6. Paragraphs, Blockquotes, Verse lines
+        //
+        // p_index must advance for every <p> match here, whether or not it
+        // ends up empty/skipped below, to stay aligned with
+        // detect_verse_paragraphs's own "every <p> counts" indexing.
+        let (is_verse, stanza_start, verse_end) = if tag == "p" {
+            let v = verse_flags.get(p_index).copied().unwrap_or(false);
+            let s = stanza_start_flags.get(p_index).copied().unwrap_or(false);
+            let e = verse_end_flags.get(p_index).copied().unwrap_or(false);
+            p_index += 1;
+            (v, s, e)
+        } else {
+            (false, false, false)
+        };
+
+        let TextAndSpans { text, mut spans } = extract_text_and_spans(elem);
 
         if !text.is_empty() {
-            let node_type = match tag.as_str() {
-                "blockquote" => "blockquote".to_string(),
-                _ => "paragraph".to_string(),
+            let node_type = if tag == "blockquote" {
+                "blockquote".to_string()
+            } else if is_verse {
+                "verse_line".to_string()
+            } else {
+                "paragraph".to_string()
             };
+
+            // Carve the leading stanza number and/or trailing line number
+            // (if present) off into their own spans so the reader can style
+            // them distinctly from the verse text, rather than either
+            // looking like a stray digit stuck to the first/last word.
+            if is_verse {
+                if let Some(len) = leading_number_len(&text) {
+                    spans.push(Span {
+                        start: 0,
+                        end: len,
+                        span_type: "stanza_number".to_string(),
+                        href: None,
+                    });
+                }
+                let total_len = text.chars().count();
+                if let Some(len) = trailing_number_len(&text) {
+                    // Guard a line that's entirely a short number (matching
+                    // both checks) from double-counting the same digits as
+                    // two overlapping spans.
+                    if len < total_len {
+                        spans.push(Span {
+                            start: total_len - len,
+                            end: total_len,
+                            span_type: "line_number".to_string(),
+                            href: None,
+                        });
+                    }
+                }
+            }
 
             // Extract footnote links referenced inside this element
             let mut footnotes = Vec::new();
@@ -682,6 +999,8 @@ pub fn parse_chapter_html(
                 source_file: chapter_path.to_string(),
                 footnotes,
                 element_id,
+                stanza_start,
+                verse_end,
             });
         }
     }

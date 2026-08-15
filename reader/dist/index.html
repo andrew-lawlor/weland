@@ -151,6 +151,25 @@
         <button type="button" id="tsLeadingUp" aria-label="Increase line spacing">+</button>
       </div>
     </div>
+    <hr class="ts-divider" />
+    <div class="ts-group">
+      <span class="ts-section-title">Verse</span>
+      <span class="ts-label">Stanza spacing</span>
+      <div class="ts-stepper">
+        <button type="button" id="tsVerseSpacingDown" aria-label="Decrease stanza spacing">–</button>
+        <span id="tsVerseSpacingValue"></span>
+        <button type="button" id="tsVerseSpacingUp" aria-label="Increase stanza spacing">+</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ Dictionary lookup popover ============ -->
+  <div id="dictionaryPopover" class="dictionary-popover" hidden>
+    <div class="dict-header">
+      <span id="dictWord"></span>
+      <button id="dictClose" aria-label="Close definition">&times;</button>
+    </div>
+    <div id="dictBody" class="dict-body"></div>
   </div>
 
   <!-- ============ Compiling overlay (EPUB import) ============ -->

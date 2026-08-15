@@ -68,6 +68,8 @@ const SPAN_TAGS = {
   strikethrough: ['<s>', '</s>'],
   underline: ['<u>', '</u>'],
   highlight: ['<mark>', '</mark>'],
+  stanza_number: ['<span class="stanza-num">', '</span>'],
+  line_number: ['<span class="line-num">', '</span>'],
 };
 
 // User-annotation ranges (as opposed to the document's own formatting spans
@@ -174,6 +176,18 @@ function renderNode(node, extraRanges) {
     case 'blockquote':
       wrapper.appendChild(textNodeElement('blockquote', node, annotations));
       break;
+    case 'verse_line': {
+      const el = textNodeElement('p', node, annotations);
+      el.classList.add('verse-line');
+      if (node.attributes && node.attributes.stanza_start) {
+        el.classList.add('verse-stanza-start');
+      }
+      if (node.attributes && node.attributes.verse_end) {
+        el.classList.add('verse-end');
+      }
+      wrapper.appendChild(el);
+      break;
+    }
     case 'list': {
       const el = buildListElement(node.attributes || {});
       el.classList.add('node-list');
@@ -1067,8 +1081,10 @@ const READING_SIZE_MIN = 14;
 const READING_SIZE_MAX = 24;
 const READING_LEADING_MIN = 1.3;
 const READING_LEADING_MAX = 2.2;
+const READING_VERSE_SPACING_MIN = 0.5;
+const READING_VERSE_SPACING_MAX = 6;
 
-let readingSettings = { font: 'literata', size_px: 17, leading: 1.75 };
+let readingSettings = { font: 'literata', size_px: 17, leading: 1.75, verse_spacing: 2 };
 
 function fontStackFor(fontId) {
   return (READING_FONTS.find((f) => f.id === fontId) || READING_FONTS[0]).stack;
@@ -1079,9 +1095,11 @@ function applyReadingSettings() {
   pane.style.setProperty('--read-font', fontStackFor(readingSettings.font));
   pane.style.setProperty('--read-size', `${readingSettings.size_px}px`);
   pane.style.setProperty('--read-leading', String(readingSettings.leading));
+  pane.style.setProperty('--verse-stanza-gap', `${readingSettings.verse_spacing}rem`);
 
   document.getElementById('tsSizeValue').textContent = `${readingSettings.size_px}px`;
   document.getElementById('tsLeadingValue').textContent = readingSettings.leading.toFixed(2);
+  document.getElementById('tsVerseSpacingValue').textContent = `${readingSettings.verse_spacing.toFixed(2)}rem`;
   document.querySelectorAll('.ts-font-option').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.font === readingSettings.font);
   });
@@ -1093,6 +1111,7 @@ async function saveReadingSettings() {
       font: readingSettings.font,
       sizePx: readingSettings.size_px,
       leading: readingSettings.leading,
+      verseSpacing: readingSettings.verse_spacing,
     });
   } catch (err) {
     console.error('Failed to save reading settings', err);
@@ -1132,6 +1151,22 @@ document.getElementById('tsLeadingDown').addEventListener('click', () => {
 });
 document.getElementById('tsLeadingUp').addEventListener('click', () => {
   readingSettings.leading = Math.min(READING_LEADING_MAX, Math.round((readingSettings.leading + 0.05) * 100) / 100);
+  applyReadingSettings();
+  saveReadingSettings();
+});
+document.getElementById('tsVerseSpacingDown').addEventListener('click', () => {
+  readingSettings.verse_spacing = Math.max(
+    READING_VERSE_SPACING_MIN,
+    Math.round((readingSettings.verse_spacing - 0.25) * 100) / 100,
+  );
+  applyReadingSettings();
+  saveReadingSettings();
+});
+document.getElementById('tsVerseSpacingUp').addEventListener('click', () => {
+  readingSettings.verse_spacing = Math.min(
+    READING_VERSE_SPACING_MAX,
+    Math.round((readingSettings.verse_spacing + 0.25) * 100) / 100,
+  );
   applyReadingSettings();
   saveReadingSettings();
 });
@@ -1231,6 +1266,133 @@ function showSelectionToolbar(rect) {
 function hideSelectionToolbar() {
   document.getElementById('selectionToolbar').hidden = true;
 }
+
+/* ================= Dictionary lookup ================= */
+
+// Double-clicking a word already produces a native single-word selection,
+// which the mouseup handler above also sees and reacts to (showing the
+// highlight/note/record toolbar) — dblclick fires right after, so just
+// override that here rather than teaching mouseup to tell the two apart.
+document.getElementById('readingPane').addEventListener('dblclick', async (e) => {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
+  const word = sel.toString().trim().replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+  if (!word) return;
+  hideSelectionToolbar();
+  showDictionaryPopover(word, e.clientX, e.clientY);
+});
+
+async function showDictionaryPopover(word, x, y) {
+  const popover = document.getElementById('dictionaryPopover');
+  document.getElementById('dictWord').textContent = word;
+  const bodyEl = document.getElementById('dictBody');
+  bodyEl.textContent = 'Looking up…';
+
+  popover.style.left = `${Math.max(8, Math.min(x, window.innerWidth - 308))}px`;
+  popover.style.top = `${Math.max(8, Math.min(y + 12, window.innerHeight - 200))}px`;
+  popover.hidden = false;
+
+  let entries;
+  try {
+    entries = await invoke('lookup_word', { word });
+  } catch (err) {
+    console.error('Dictionary lookup failed', err);
+    bodyEl.textContent = 'Lookup failed.';
+    return;
+  }
+
+  renderDictionaryResult(word, entries, 'local');
+}
+
+// Shared renderer for both the offline GCIDE result and the online fallback
+// result, so the two look the same once something's found.
+function renderDictionaryResult(word, entries, source) {
+  const bodyEl = document.getElementById('dictBody');
+  bodyEl.innerHTML = '';
+
+  if (!entries.length) {
+    const msg = document.createElement('p');
+    msg.className = 'dict-empty';
+    msg.textContent = source === 'online'
+      ? `No online definition found for "${word}" either.`
+      : `No definition found for "${word}".`;
+    bodyEl.appendChild(msg);
+
+    // Never fetch automatically — this app is otherwise fully offline, so
+    // reaching out to a third-party API is something the reader opts into
+    // per lookup, not a silent fallback.
+    if (source !== 'online') {
+      const onlineBtn = document.createElement('button');
+      onlineBtn.type = 'button';
+      onlineBtn.className = 'dict-online-btn';
+      onlineBtn.textContent = 'Look up online…';
+      onlineBtn.addEventListener('click', () => lookupWordOnline(word));
+      bodyEl.appendChild(onlineBtn);
+    }
+    return;
+  }
+
+  for (const entry of entries) {
+    const div = document.createElement('div');
+    div.className = 'dict-entry';
+    div.textContent = entry.definition;
+    bodyEl.appendChild(div);
+  }
+
+  const attribution = document.createElement('div');
+  attribution.className = 'dict-attribution';
+  attribution.textContent = source === 'online'
+    ? 'Source: Wiktionary, via dictionaryapi.dev'
+    : 'Source: GCIDE (GNU Collaborative International Dictionary of English)';
+  bodyEl.appendChild(attribution);
+}
+
+async function lookupWordOnline(word) {
+  const bodyEl = document.getElementById('dictBody');
+  bodyEl.innerHTML = '';
+  const loading = document.createElement('p');
+  loading.className = 'dict-empty';
+  loading.textContent = 'Looking up online…';
+  bodyEl.appendChild(loading);
+
+  let entries = [];
+  try {
+    // Done in Rust (reqwest), not the webview's own fetch() — that turned
+    // out to be unreliable across repeated calls in webkit2gtk.
+    entries = await invoke('lookup_word_online', { word });
+  } catch (err) {
+    console.error('Online dictionary lookup failed', err);
+    bodyEl.innerHTML = '';
+    const msg = document.createElement('p');
+    msg.className = 'dict-empty';
+    msg.textContent = 'Online lookup failed — check your connection.';
+    bodyEl.appendChild(msg);
+    return;
+  }
+
+  renderDictionaryResult(word, entries, 'online');
+}
+
+document.getElementById('dictClose').addEventListener('click', () => {
+  document.getElementById('dictionaryPopover').hidden = true;
+});
+
+// A click on the "Look up online" button replaces the popover's own body
+// content (bodyEl.innerHTML = '') while this same click is still bubbling —
+// which detaches e.target before it reaches document, so the outside-click
+// handler below would see `popover.contains(e.target)` as false and close
+// the popover instantly, right as the fetch was starting. Stop it from ever
+// bubbling that far, regardless of what a click handler inside the popover
+// mutates.
+document.getElementById('dictionaryPopover').addEventListener('click', (e) => {
+  e.stopPropagation();
+});
+
+document.addEventListener('click', (e) => {
+  const popover = document.getElementById('dictionaryPopover');
+  if (popover.hidden || popover.contains(e.target)) return;
+  popover.hidden = true;
+});
 
 document.getElementById('selectionToolbar').addEventListener('click', async (e) => {
   const action = e.target.closest('button')?.dataset.action;
@@ -1399,6 +1561,7 @@ document.addEventListener('keydown', (e) => {
   document.getElementById('searchResults').hidden = true;
   document.getElementById('annotationsPanel').hidden = true;
   document.getElementById('textSettingsPanel').hidden = true;
+  document.getElementById('dictionaryPopover').hidden = true;
 });
 
 /* ================= Keyboard navigation ================= */

@@ -252,10 +252,14 @@ pub fn compile_epub<P: AsRef<Path>, Q: AsRef<Path>>(
                         source_file,
                         footnotes,
                         element_id,
+                        stanza_start,
+                        verse_end,
                     } => {
                         let attrs = json!({
                             "source_file": source_file,
-                            "spans": spans
+                            "spans": spans,
+                            "stanza_start": stanza_start,
+                            "verse_end": verse_end
                         });
 
                         let parent_node_id: i64 = stmt_node.query_row(

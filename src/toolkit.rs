@@ -412,7 +412,7 @@ pub fn export_wld<P: AsRef<Path>, Q: AsRef<Path>>(
                             }
                         }
                     }
-                    "paragraph" => {
+                    "paragraph" | "verse_line" => {
                         if let Some(ref text) = node.content {
                             let spans: Vec<Span> = node
                                 .attributes
@@ -423,7 +423,14 @@ pub fn export_wld<P: AsRef<Path>, Q: AsRef<Path>>(
 
                             let formatted = format_markdown_spans(text, &spans);
                             out.push_str(&formatted);
-                            out.push_str("\n\n");
+                            // A single newline, not a blank line, between
+                            // consecutive verse lines — otherwise every line of
+                            // a poem gets rendered as its own separate paragraph.
+                            if node.node_type == "verse_line" {
+                                out.push('\n');
+                            } else {
+                                out.push_str("\n\n");
+                            }
                         }
                     }
                     _ => {

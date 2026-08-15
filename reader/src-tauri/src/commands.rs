@@ -229,6 +229,8 @@ struct Settings {
     reading_size_px: Option<f64>,
     #[serde(default)]
     reading_leading: Option<f64>,
+    #[serde(default)]
+    reading_verse_spacing: Option<f64>,
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -281,12 +283,14 @@ pub fn set_author_name(name: String, app: AppHandle) -> Result<(), String> {
 const DEFAULT_READING_FONT: &str = "literata";
 const DEFAULT_READING_SIZE_PX: f64 = 17.0;
 const DEFAULT_READING_LEADING: f64 = 1.75;
+const DEFAULT_READING_VERSE_SPACING: f64 = 2.0;
 
 #[derive(serde::Serialize)]
 pub struct ReadingSettings {
     pub font: String,
     pub size_px: f64,
     pub leading: f64,
+    pub verse_spacing: f64,
 }
 
 #[tauri::command]
@@ -296,15 +300,23 @@ pub fn get_reading_settings(app: AppHandle) -> Result<ReadingSettings, String> {
         font: s.reading_font.unwrap_or_else(|| DEFAULT_READING_FONT.to_string()),
         size_px: s.reading_size_px.unwrap_or(DEFAULT_READING_SIZE_PX),
         leading: s.reading_leading.unwrap_or(DEFAULT_READING_LEADING),
+        verse_spacing: s.reading_verse_spacing.unwrap_or(DEFAULT_READING_VERSE_SPACING),
     })
 }
 
 #[tauri::command]
-pub fn set_reading_settings(font: String, size_px: f64, leading: f64, app: AppHandle) -> Result<(), String> {
+pub fn set_reading_settings(
+    font: String,
+    size_px: f64,
+    leading: f64,
+    verse_spacing: f64,
+    app: AppHandle,
+) -> Result<(), String> {
     let mut settings = read_settings(&app);
     settings.reading_font = Some(font);
     settings.reading_size_px = Some(size_px);
     settings.reading_leading = Some(leading);
+    settings.reading_verse_spacing = Some(verse_spacing);
     write_settings(&app, &settings)
 }
 

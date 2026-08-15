@@ -629,6 +629,12 @@ button {
   letter-spacing: 0.07em;
   color: var(--muted);
 }
+.ts-divider { border: none; border-top: 1px solid var(--hairline); margin: 0.1rem 0; }
+.ts-section-title {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--ink);
+}
 .ts-fonts { display: grid; grid-template-columns: 1fr 1fr; gap: 0.3rem; }
 .ts-font-option {
   all: unset;
@@ -766,6 +772,7 @@ button {
   --read-font: "Literata", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
   --read-size: 17px;
   --read-leading: 1.75;
+  --verse-stanza-gap: 2rem;
   font-size: var(--read-size);
 }
 .reading-pane article { max-width: 60ch; margin: 0 auto; }
@@ -787,12 +794,39 @@ button {
   font-size: 1em;
   line-height: var(--read-leading);
   margin: 0 0 1.25rem;
+  /* A <br> is now preserved as \n in node content instead of being dropped —
+     without this, the browser would collapse it back into a space anyway. */
+  white-space: pre-line;
 }
 blockquote.node-text {
   border-left: 2px solid var(--hairline);
   padding-left: 1rem;
   color: var(--muted);
   font-style: italic;
+}
+/* Verse: tight within a stanza (no per-line paragraph gap), with breathing
+   room only where a new stanza actually starts. */
+.verse-line {
+  margin: 0;
+  line-height: 1.55;
+}
+.verse-line.verse-stanza-start {
+  margin-top: var(--verse-stanza-gap);
+}
+.verse-line.verse-end {
+  margin-bottom: 1.25rem;
+}
+.stanza-num {
+  color: var(--muted);
+  font-size: 0.82em;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.line-num {
+  color: var(--muted);
+  font-size: 0.72em;
+  font-variant-numeric: tabular-nums;
+  margin-left: 0.5em;
 }
 .node-list {
   padding-left: 1.3rem;
@@ -1089,6 +1123,81 @@ blockquote.node-text {
   padding: 1rem 0.65rem;
   font-size: 0.82rem;
   color: var(--muted);
+}
+
+/* ================= Dictionary lookup popover ================= */
+.dictionary-popover {
+  position: fixed;
+  z-index: 35;
+  width: 300px;
+  max-height: 320px;
+  display: flex;
+  flex-direction: column;
+  background: var(--paper);
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  box-shadow: 0 16px 34px -14px var(--shadow);
+}
+.dict-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.6rem 0.7rem;
+  border-bottom: 1px solid var(--hairline);
+  flex: none;
+}
+.dict-header span {
+  font-family: var(--read-font, serif);
+  font-weight: 700;
+  font-size: 0.95rem;
+  color: var(--ink);
+}
+.dict-header button {
+  all: unset;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 1.1rem;
+  line-height: 1;
+  padding: 0.1rem 0.3rem;
+}
+.dict-header button:hover { color: var(--ink); }
+.dict-body {
+  padding: 0.7rem;
+  overflow-y: auto;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--ink);
+  white-space: pre-wrap;
+}
+.dict-entry + .dict-entry {
+  margin-top: 0.6rem;
+  padding-top: 0.6rem;
+  border-top: 1px solid var(--hairline);
+}
+.dict-empty {
+  margin: 0 0 0.6rem;
+  color: var(--muted);
+  white-space: normal;
+}
+.dict-online-btn {
+  all: unset;
+  cursor: pointer;
+  display: inline-block;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.35rem 0.6rem;
+}
+.dict-online-btn:hover { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.dict-attribution {
+  margin-top: 0.7rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--hairline);
+  font-size: 0.68rem;
+  color: var(--muted);
+  white-space: normal;
 }
 
 /* ================= Selection toolbar ================= */
