@@ -4,12 +4,18 @@ mod commands;
 mod dictionary;
 
 use rusqlite::Connection;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use tauri::{Manager, State};
 
 pub struct AppState {
     pub db: Mutex<Option<Connection>>,
     pub dict_db: Mutex<Option<Connection>>,
+    // Cover art doesn't change once a .wld is compiled, but list_library gets
+    // called on every return to the library view — without this, that meant
+    // re-opening every book's sqlite file and re-decoding its cover blob to
+    // base64 from scratch each time, which gets slow with 100+ books.
+    pub cover_cache: Mutex<HashMap<String, Option<String>>>,
 }
 
 fn asset_response(mime: String, data: Vec<u8>) -> tauri::http::Response<Vec<u8>> {
@@ -33,7 +39,7 @@ fn not_found() -> tauri::http::Response<Vec<u8>> {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(AppState { db: Mutex::new(None), dict_db: Mutex::new(None) })
+        .manage(AppState { db: Mutex::new(None), dict_db: Mutex::new(None), cover_cache: Mutex::new(HashMap::new()) })
         .register_uri_scheme_protocol("weland-asset", |ctx, request| {
             let app = ctx.app_handle();
             let state: State<AppState> = app.state();
@@ -70,6 +76,9 @@ fn main() {
             commands::set_author_name,
             commands::list_library,
             commands::remove_from_library,
+            commands::export_book,
+            commands::export_library,
+            commands::import_folder,
             commands::get_reading_settings,
             commands::set_reading_settings,
             commands::update_reading_position,

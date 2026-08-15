@@ -505,6 +505,29 @@ button {
   border-color: var(--ember);
   color: var(--paper);
 }
+.library-card-export {
+  all: unset;
+  cursor: pointer;
+  position: absolute;
+  top: -7px; left: -7px;
+  z-index: 2;
+  width: 22px; height: 22px;
+  display: grid; place-items: center;
+  border-radius: 50%;
+  background: var(--paper);
+  border: 1px solid var(--hairline);
+  color: var(--muted);
+  font-size: 0.95rem;
+  line-height: 1;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.library-card-export:hover,
+.library-card-export:focus-visible {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--paper);
+}
+.library-card-export:disabled { cursor: not-allowed; opacity: 0.5; }
 
 .btn-primary {
   all: unset;
@@ -518,6 +541,19 @@ button {
 }
 .btn-primary:hover { filter: brightness(1.08); }
 .btn-primary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.btn-secondary {
+  all: unset;
+  cursor: pointer;
+  background: transparent;
+  color: var(--ink);
+  font-weight: 600;
+  font-size: 0.88rem;
+  padding: 0.6rem 1.3rem;
+  border-radius: 999px;
+  border: 1px solid var(--hairline);
+}
+.btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
+.btn-secondary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .open-error {
   margin-top: 1rem;
   color: var(--ember);
@@ -1332,6 +1368,7 @@ blockquote.node-text {
   flex-direction: column;
   align-items: center;
   gap: 0.9rem;
+  width: 320px;
   background: var(--paper);
   border: 1px solid var(--hairline);
   border-radius: 12px;
@@ -1344,6 +1381,15 @@ blockquote.node-text {
   font-family: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
   font-size: 0.95rem;
   color: var(--ink);
+}
+.compiling-card p.compiling-progress {
+  margin-top: -0.5rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ================= Floating voice recorder ================= */

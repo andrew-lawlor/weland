@@ -16,7 +16,7 @@ function assetUrl(assetId) {
 // Native window.confirm() is a silent no-op on Tauri's Linux (webkit2gtk)
 // backend — it never wires up the WebKit script-dialog signal needed to
 // actually show it — so destructive actions need this custom modal instead.
-function showConfirm(message, { title = 'Are you sure?', confirmLabel = 'Confirm' } = {}) {
+function showConfirm(message, { title = 'Are you sure?', confirmLabel = 'Confirm', alertOnly = false } = {}) {
   return new Promise((resolve) => {
     const modal = document.getElementById('confirmModal');
     const okBtn = document.getElementById('confirmOk');
@@ -24,6 +24,12 @@ function showConfirm(message, { title = 'Are you sure?', confirmLabel = 'Confirm
     document.getElementById('confirmTitle').textContent = title;
     document.getElementById('confirmMessage').textContent = message;
     okBtn.textContent = confirmLabel;
+    // alertOnly is for pure informational messages (e.g. a completion
+    // summary) where there's no real decision to make — Cancel would be
+    // a dead end, and the danger-red styling implies a destructive action
+    // that isn't happening here.
+    cancelBtn.hidden = alertOnly;
+    okBtn.classList.toggle('btn-danger', !alertOnly);
     modal.hidden = false;
 
     function cleanup(result) {
@@ -736,6 +742,79 @@ document.getElementById('openBookBtn').addEventListener('click', async () => {
   }
 });
 
+async function exportBook(path, title) {
+  const destPath = await dialogApi.save({
+    defaultPath: `${title}.wld`,
+    filters: [{ name: 'Weland book', extensions: ['wld'] }],
+  });
+  if (!destPath) return;
+  try {
+    await invoke('export_book', { path, destPath });
+  } catch (err) {
+    const errorEl = document.getElementById('openError');
+    errorEl.textContent = String(err);
+    errorEl.hidden = false;
+  }
+}
+
+async function exportLibrary() {
+  const destDir = await dialogApi.open({ directory: true });
+  if (!destDir) return;
+  try {
+    const result = await invoke('export_library', { destDir });
+    const msg = `Exported ${result.exported.length} book(s)` +
+      (result.failed.length ? `, ${result.failed.length} failed.` : '.');
+    await showConfirm(msg, { title: 'Export complete', confirmLabel: 'OK', alertOnly: true });
+  } catch (err) {
+    console.error('Failed to export library', err);
+  }
+}
+
+document.getElementById('exportLibraryBtn').addEventListener('click', exportLibrary);
+
+async function importFolder(rootPath) {
+  const errorEl = document.getElementById('openError');
+  errorEl.hidden = true;
+  const progressEl = document.getElementById('compilingProgress');
+
+  setCompilingOverlay(true);
+  progressEl.hidden = false;
+  progressEl.textContent = 'Scanning folder…';
+  await nextPaint();
+
+  const { listen } = window.__TAURI__.event;
+  const unlisten = await listen('bulk-import-progress', (event) => {
+    const { current, total, title } = event.payload;
+    progressEl.textContent = `Importing ${current} of ${total}: ${title}`;
+  });
+
+  try {
+    const summary = await invoke('import_folder', { rootPath });
+    unlisten();
+    setCompilingOverlay(false);
+    progressEl.hidden = true;
+    await loadLibrary();
+    const parts = [];
+    if (summary.imported.length) parts.push(`${summary.imported.length} imported`);
+    if (summary.skipped.length) parts.push(`${summary.skipped.length} already in library`);
+    if (summary.failed.length) parts.push(`${summary.failed.length} failed`);
+    const msg = parts.length ? parts.join(', ') + '.' : 'No EPUB files found in that folder.';
+    await showConfirm(msg, { title: 'Import folder', confirmLabel: 'OK', alertOnly: true });
+  } catch (err) {
+    unlisten();
+    setCompilingOverlay(false);
+    progressEl.hidden = true;
+    errorEl.textContent = String(err);
+    errorEl.hidden = false;
+  }
+}
+
+document.getElementById('importFolderBtn').addEventListener('click', async () => {
+  const folder = await dialogApi.open({ directory: true });
+  if (!folder) return;
+  await importFolder(folder);
+});
+
 /* ================= Library ================= */
 
 let libraryBooks = [];
@@ -834,7 +913,19 @@ function renderLibrary(filterText) {
       }
     });
 
-    li.append(openBtn, removeBtn);
+    const exportBtn = document.createElement('button');
+    exportBtn.type = 'button';
+    exportBtn.className = 'library-card-export';
+    exportBtn.title = 'Export';
+    exportBtn.setAttribute('aria-label', 'Export this book');
+    exportBtn.textContent = '⇩';
+    exportBtn.disabled = !book.available;
+    exportBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      exportBook(book.path, book.title);
+    });
+
+    li.append(openBtn, exportBtn, removeBtn);
     grid.appendChild(li);
   }
 }
@@ -849,8 +940,14 @@ async function loadLibrary() {
   renderLibrary(document.getElementById('librarySearch').value.trim());
 }
 
+// Debounced: renderLibrary rebuilds the whole grid (every card, every cover
+// image) from scratch, so re-running it on every keystroke while typing
+// fast is what made search feel like it was momentarily locking up.
+let librarySearchTimeout = null;
 document.getElementById('librarySearch').addEventListener('input', (e) => {
-  renderLibrary(e.target.value.trim());
+  clearTimeout(librarySearchTimeout);
+  const value = e.target.value.trim();
+  librarySearchTimeout = setTimeout(() => renderLibrary(value), 120);
 });
 
 document.getElementById('libraryBtn').addEventListener('click', () => {
@@ -858,7 +955,23 @@ document.getElementById('libraryBtn').addEventListener('click', () => {
   saveReadingPosition();
   document.getElementById('appFrame').hidden = true;
   document.getElementById('emptyState').hidden = false;
-  loadLibrary();
+
+  // Opening this book already bumped its last_opened_at server-side. If it
+  // was already in our cached library list, just reflect that locally and
+  // re-render instead of paying for a full list_library round-trip (which
+  // re-fetches every book's cover, not just this one) to move one card to
+  // the top. A book that isn't in the cached list yet (freshly imported or
+  // opened straight from a file picker, bypassing the library grid) still
+  // needs a real refetch to pick up its metadata and cover for the first time.
+  const path = currentBook && currentBook.path;
+  const existing = path && libraryBooks.find((b) => b.path === path);
+  if (existing) {
+    existing.last_opened_at = Math.floor(Date.now() / 1000);
+    libraryBooks.sort((a, b) => b.last_opened_at - a.last_opened_at);
+    renderLibrary(document.getElementById('librarySearch').value.trim());
+  } else {
+    loadLibrary();
+  }
 });
 
 // Session-only: resets to expanded on next launch, nothing persisted.

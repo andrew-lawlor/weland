@@ -16,6 +16,8 @@
       </h1>
       <div class="library-topbar-actions">
         <input type="text" id="librarySearch" class="library-search" placeholder="Search your library…" hidden />
+        <button id="exportLibraryBtn" class="btn-secondary">Export library…</button>
+        <button id="importFolderBtn" class="btn-secondary">Import folder…</button>
         <button id="openBookBtn" class="btn-primary">Open a book…</button>
       </div>
     </header>
@@ -177,6 +179,7 @@
     <div class="compiling-card">
       <img src="forge-anvil.gif" alt="" />
       <p>Forging your book…</p>
+      <p id="compilingProgress" class="compiling-progress" hidden></p>
     </div>
   </div>
 

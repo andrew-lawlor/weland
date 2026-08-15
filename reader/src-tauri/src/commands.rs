@@ -2,10 +2,10 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
-use tauri::{AppHandle, Manager, State};
+use std::path::{Path, PathBuf};
+use tauri::{AppHandle, Emitter, Manager, State};
 
-use weland::compiler::{compile_epub, default_wld_output_path, CompileOptions};
+use weland::compiler::{compile_epub, CompileOptions};
 use weland::db::{self, NewAnnotation, SearchHit};
 use weland::schema::{AstNode, TocEntry, UserAnnotation};
 
@@ -23,6 +23,37 @@ pub struct BookPayload {
 
 fn locked_conn<'a>(guard: &'a std::sync::MutexGuard<'_, Option<Connection>>) -> Result<&'a Connection, String> {
     guard.as_ref().ok_or_else(|| "No book is open".to_string())
+}
+
+// Deterministic per-source sandboxed path: same source EPUB (by canonical
+// path) always resolves to the same output, so re-importing an already-
+// compiled book still hits the `if !output.exists()` skip in import_epub
+// and never clobbers its annotations. DefaultHasher::new() uses fixed
+// keys (unlike HashMap's randomized RandomState), so this is stable
+// across process restarts on a given Rust toolchain — it only needs to
+// be self-consistent, never portable, since nothing persists the hash.
+fn sandboxed_wld_output_path(app: &AppHandle, input: &Path) -> Result<PathBuf, String> {
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let books_dir = data_dir.join("books");
+    fs::create_dir_all(&books_dir).map_err(|e| e.to_string())?;
+
+    let canonical = fs::canonicalize(input)
+        .map_err(|e| format!("Failed to resolve {}: {e}", input.display()))?;
+    let hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        canonical.hash(&mut h);
+        h.finish()
+    };
+
+    let raw_stem = input.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "book".into());
+    let sanitized: String = raw_stem
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let sanitized = if sanitized.is_empty() { "book".to_string() } else { sanitized };
+
+    Ok(books_dir.join(format!("{sanitized}-{hash:016x}.wld")))
 }
 
 #[tauri::command]
@@ -75,7 +106,7 @@ pub async fn import_epub(
     let input = std::path::Path::new(&input_path).to_path_buf();
     let output = match output_path {
         Some(p) => PathBuf::from(p),
-        None => default_wld_output_path(&input),
+        None => sandboxed_wld_output_path(&app, &input)?,
     };
 
     if !output.exists() {
@@ -432,15 +463,24 @@ fn load_cover_data_uri(path: &str) -> anyhow::Result<Option<String>> {
 }
 
 #[tauri::command]
-pub fn list_library(app: AppHandle) -> Result<Vec<LibraryBook>, String> {
+pub fn list_library(app: AppHandle, state: State<AppState>) -> Result<Vec<LibraryBook>, String> {
     let mut entries = read_library(&app)?;
     entries.sort_by(|a, b| b.last_opened_at.cmp(&a.last_opened_at));
+
+    let mut cache = state.cover_cache.lock().map_err(|e| e.to_string())?;
 
     Ok(entries
         .into_iter()
         .map(|e| {
             let available = std::path::Path::new(&e.path).exists();
-            let cover_data_uri = if available { load_cover_data_uri(&e.path).ok().flatten() } else { None };
+            let cover_data_uri = if available {
+                cache
+                    .entry(e.path.clone())
+                    .or_insert_with(|| load_cover_data_uri(&e.path).ok().flatten())
+                    .clone()
+            } else {
+                None
+            };
             LibraryBook {
                 path: e.path,
                 title: e.title,
@@ -459,4 +499,170 @@ pub fn remove_from_library(path: String, app: AppHandle) -> Result<(), String> {
     let mut entries = read_library(&app)?;
     entries.retain(|e| e.path != path);
     write_library(&app, &entries)
+}
+
+// Copies a book's sandboxed .wld out to a user-chosen location — the sole
+// way a book leaves the app's sandboxed data dir intact. `path` in
+// library.json (the identity key used everywhere else) is never touched;
+// this is a copy-out, not a move.
+#[tauri::command]
+pub fn export_book(path: String, dest_path: String) -> Result<(), String> {
+    fs::copy(&path, &dest_path).map_err(|e| format!("Failed to export {path}: {e}"))?;
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+pub struct ExportResult {
+    pub exported: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+// Bulk-copies every library book that still has a backing file into
+// `dest_dir`. Missing-file entries are skipped (nothing to export, not a
+// failure); one book's copy failing doesn't abort the rest of the batch.
+#[tauri::command]
+pub fn export_library(dest_dir: String, app: AppHandle) -> Result<ExportResult, String> {
+    let entries = read_library(&app)?;
+    let dest = PathBuf::from(&dest_dir);
+    let mut exported = Vec::new();
+    let mut failed = Vec::new();
+    let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for e in entries.iter().filter(|e| Path::new(&e.path).exists()) {
+        let sanitized: String = e
+            .title
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == ' ' || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        let base = if sanitized.trim().is_empty() { "book".to_string() } else { sanitized.trim().to_string() };
+        let mut name = format!("{base}.wld");
+        let mut n = 1;
+        while used_names.contains(&name) {
+            n += 1;
+            name = format!("{base} ({n}).wld");
+        }
+        used_names.insert(name.clone());
+
+        match fs::copy(&e.path, dest.join(&name)) {
+            Ok(_) => exported.push(name),
+            Err(err) => failed.push(format!("{}: {err}", e.title)),
+        }
+    }
+    Ok(ExportResult { exported, failed })
+}
+
+// Iteratively (not recursively, to avoid stack depth concerns on deep
+// libraries) walks `root` for .epub files. Hidden directories (Calibre's
+// `.caltrash`, `.git`, etc.) are skipped; unreadable subdirectories are
+// skipped rather than aborting the whole scan.
+fn find_epubs_recursive(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let hidden = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with('.'))
+                    .unwrap_or(false);
+                if !hidden {
+                    stack.push(path);
+                }
+            } else if path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("epub")).unwrap_or(false) {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+// Registers an already-compiled .wld into the library without touching
+// AppState's single "currently open" connection slot — open_book isn't
+// reused here since bulk import shouldn't leave that slot pointing at
+// whatever book happened to be imported last.
+fn register_imported_book(app: &AppHandle, path: &Path) -> Result<String, String> {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| e.to_string())?;
+    let metadata = db::load_metadata(&conn).map_err(|e| e.to_string())?;
+    let title = metadata.get("title").cloned().unwrap_or_else(|| {
+        path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Untitled".to_string())
+    });
+    upsert_library_entry(app, &path.to_string_lossy(), &title, metadata.get("author").map(|s| s.as_str()))?;
+    Ok(title)
+}
+
+#[derive(Clone, serde::Serialize)]
+struct BulkImportProgress {
+    current: usize,
+    total: usize,
+    title: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct BulkImportSummary {
+    pub imported: Vec<String>,
+    pub skipped: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+// Recursively imports every EPUB under `root_path`, emitting a
+// "bulk-import-progress" event before each attempt so the frontend can
+// show live "Importing X of N" feedback. Already-imported books (same
+// sandboxed output path already exists) are skipped, not recompiled —
+// same idempotency guarantee as a single import_epub call. One book
+// failing doesn't abort the batch.
+#[tauri::command]
+pub async fn import_folder(root_path: String, app: AppHandle) -> Result<BulkImportSummary, String> {
+    let root = PathBuf::from(&root_path);
+    if !root.is_dir() {
+        return Err(format!("{root_path} is not a folder"));
+    }
+
+    let scan_root = root.clone();
+    let epub_paths = tauri::async_runtime::spawn_blocking(move || find_epubs_recursive(&scan_root))
+        .await
+        .map_err(|e| format!("Folder scan failed: {e}"))?;
+
+    let total = epub_paths.len();
+    let mut summary = BulkImportSummary { imported: Vec::new(), skipped: Vec::new(), failed: Vec::new() };
+
+    for (i, input) in epub_paths.into_iter().enumerate() {
+        let stem = input.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "book".to_string());
+        let _ = app.emit("bulk-import-progress", BulkImportProgress { current: i + 1, total, title: stem.clone() });
+
+        let output = match sandboxed_wld_output_path(&app, &input) {
+            Ok(p) => p,
+            Err(err) => {
+                summary.failed.push(format!("{stem}: {err}"));
+                continue;
+            }
+        };
+
+        if output.exists() {
+            summary.skipped.push(stem);
+            continue;
+        }
+
+        let compile_target = output.clone();
+        let compile_input = input.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            let options = CompileOptions { quiet: true, verbose: false };
+            compile_epub(&compile_input, &compile_target, &options)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(_)) => match register_imported_book(&app, &output) {
+                Ok(title) => summary.imported.push(title),
+                Err(err) => summary.failed.push(format!("{stem}: {err}")),
+            },
+            Ok(Err(err)) => summary.failed.push(format!("{stem}: {err}")),
+            Err(err) => summary.failed.push(format!("{stem}: task failed: {err}")),
+        }
+    }
+
+    Ok(summary)
 }
