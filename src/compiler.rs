@@ -220,7 +220,7 @@ pub fn compile_epub<P: AsRef<Path>, Q: AsRef<Path>>(
                         level,
                         text,
                         spans,
-                        element_id,
+                        element_ids,
                     } => {
                         let attrs = json!({
                             "level": level,
@@ -238,8 +238,10 @@ pub fn compile_epub<P: AsRef<Path>, Q: AsRef<Path>>(
                         if !chapter_first_node_map.contains_key(chapter_path) {
                             chapter_first_node_map.insert(chapter_path.clone(), node_id);
                         }
-                        if let Some(ref el_id) = element_id {
-                            element_id_map.insert((chapter_path.clone(), el_id.clone()), node_id);
+                        for el_id in &element_ids {
+                            element_id_map
+                                .entry((chapter_path.clone(), el_id.clone()))
+                                .or_insert(node_id);
                         }
                         heading_nodes.push((node_id, text));
                         ordinal += 1;
@@ -251,7 +253,7 @@ pub fn compile_epub<P: AsRef<Path>, Q: AsRef<Path>>(
                         spans,
                         source_file,
                         footnotes,
-                        element_id,
+                        element_ids,
                         stanza_start,
                         verse_end,
                     } => {
@@ -273,8 +275,10 @@ pub fn compile_epub<P: AsRef<Path>, Q: AsRef<Path>>(
                         if !chapter_first_node_map.contains_key(chapter_path) {
                             chapter_first_node_map.insert(chapter_path.clone(), parent_node_id);
                         }
-                        if let Some(ref el_id) = element_id {
-                            element_id_map.insert((chapter_path.clone(), el_id.clone()), parent_node_id);
+                        for el_id in &element_ids {
+                            element_id_map
+                                .entry((chapter_path.clone(), el_id.clone()))
+                                .or_insert(parent_node_id);
                         }
                         ordinal += 1;
 
@@ -305,7 +309,7 @@ pub fn compile_epub<P: AsRef<Path>, Q: AsRef<Path>>(
                         }
                     }
 
-                    ChapterElement::ThematicBreak { element_id } => {
+                    ChapterElement::ThematicBreak { element_ids } => {
                         let attrs = json!({});
                         let node_id: i64 = stmt_node.query_row(
                             params![None::<i64>, ordinal, "thematic_break", None::<String>, attrs.to_string()],
@@ -316,13 +320,15 @@ pub fn compile_epub<P: AsRef<Path>, Q: AsRef<Path>>(
                         if !chapter_first_node_map.contains_key(chapter_path) {
                             chapter_first_node_map.insert(chapter_path.clone(), node_id);
                         }
-                        if let Some(ref el_id) = element_id {
-                            element_id_map.insert((chapter_path.clone(), el_id.clone()), node_id);
+                        for el_id in &element_ids {
+                            element_id_map
+                                .entry((chapter_path.clone(), el_id.clone()))
+                                .or_insert(node_id);
                         }
                         ordinal += 1;
                     }
 
-                    ChapterElement::Table { text, rows, source_file, element_id } => {
+                    ChapterElement::Table { text, rows, source_file, element_ids } => {
                         let attrs = json!({
                             "rows": rows,
                             "source_file": source_file
@@ -339,13 +345,15 @@ pub fn compile_epub<P: AsRef<Path>, Q: AsRef<Path>>(
                         if !chapter_first_node_map.contains_key(chapter_path) {
                             chapter_first_node_map.insert(chapter_path.clone(), node_id);
                         }
-                        if let Some(ref el_id) = element_id {
-                            element_id_map.insert((chapter_path.clone(), el_id.clone()), node_id);
+                        for el_id in &element_ids {
+                            element_id_map
+                                .entry((chapter_path.clone(), el_id.clone()))
+                                .or_insert(node_id);
                         }
                         ordinal += 1;
                     }
 
-                    ChapterElement::List { ordered, text, spans, items, source_file, element_id } => {
+                    ChapterElement::List { ordered, text, spans, items, source_file, element_ids } => {
                         let attrs = json!({
                             "ordered": ordered,
                             "items": items,
@@ -364,13 +372,15 @@ pub fn compile_epub<P: AsRef<Path>, Q: AsRef<Path>>(
                         if !chapter_first_node_map.contains_key(chapter_path) {
                             chapter_first_node_map.insert(chapter_path.clone(), node_id);
                         }
-                        if let Some(ref el_id) = element_id {
-                            element_id_map.insert((chapter_path.clone(), el_id.clone()), node_id);
+                        for el_id in &element_ids {
+                            element_id_map
+                                .entry((chapter_path.clone(), el_id.clone()))
+                                .or_insert(node_id);
                         }
                         ordinal += 1;
                     }
 
-                    ChapterElement::Image { src, alt, caption, element_id } => {
+                    ChapterElement::Image { src, alt, caption, element_ids } => {
                         let full_img_path = resolve_relative_path(&chapter_dir, &src);
                         if let Ok(img_bytes) = epub.read_bytes(&full_img_path) {
                             let mut hasher = Sha256::new();
@@ -406,8 +416,10 @@ pub fn compile_epub<P: AsRef<Path>, Q: AsRef<Path>>(
                             if !chapter_first_node_map.contains_key(chapter_path) {
                                 chapter_first_node_map.insert(chapter_path.clone(), node_id);
                             }
-                            if let Some(ref el_id) = element_id {
-                                element_id_map.insert((chapter_path.clone(), el_id.clone()), node_id);
+                            for el_id in &element_ids {
+                                element_id_map
+                                    .entry((chapter_path.clone(), el_id.clone()))
+                                    .or_insert(node_id);
                             }
                             ordinal += 1;
                         }

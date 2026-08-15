@@ -16,7 +16,7 @@ pub enum ChapterElement {
         level: u8,
         text: String,
         spans: Vec<Span>,
-        element_id: Option<String>,
+        element_ids: Vec<String>,
     },
     Paragraph {
         node_type: String, // "paragraph", "blockquote", "verse_line"
@@ -24,7 +24,7 @@ pub enum ChapterElement {
         spans: Vec<Span>,
         source_file: String,
         footnotes: Vec<FootnoteRef>,
-        element_id: Option<String>,
+        element_ids: Vec<String>,
         // Only meaningful for "verse_line": true if this line starts a new
         // stanza (its <p> has a different parent than the previous verse
         // line's), so the reader can add breathing room between stanzas
@@ -37,19 +37,19 @@ pub enum ChapterElement {
         verse_end: bool,
     },
     ThematicBreak {
-        element_id: Option<String>,
+        element_ids: Vec<String>,
     },
     Table {
         text: String,
         rows: Vec<Vec<String>>,
         source_file: String,
-        element_id: Option<String>,
+        element_ids: Vec<String>,
     },
     Image {
         src: String,
         alt: String,
         caption: String,
-        element_id: Option<String>,
+        element_ids: Vec<String>,
     },
     List {
         ordered: bool,
@@ -57,7 +57,7 @@ pub enum ChapterElement {
         spans: Vec<Span>,
         items: Vec<ListItem>,
         source_file: String,
-        element_id: Option<String>,
+        element_ids: Vec<String>,
     },
 }
 
@@ -703,6 +703,37 @@ fn is_nested_in_list_item(elem: ElementRef) -> bool {
     false
 }
 
+/// True if `elem` (a `<div>`) contains no nested block-level element — i.e.
+/// it holds only inline content (text, spans, links, `<br>`) and should be
+/// treated as a paragraph-equivalent leaf, not a structural wrapper.
+/// Vintage EPUB2 conversions often mark every paragraph as
+/// `<div class="...">` instead of `<p>`; a wrapper div containing those leaf
+/// divs must NOT also be treated as one giant paragraph, or its children's
+/// text would be captured twice.
+fn is_leaf_content_div(elem: ElementRef, block_selector: &Selector) -> bool {
+    elem.select(block_selector).next().is_none()
+}
+
+/// Collects the `id`/`name` attributes of every ancestor element between
+/// `elem` and `<body>` (exclusive), innermost first. EPUBs commonly wrap each
+/// addressable unit (a poem's canto, a play's scene) in a `<section id="...">`
+/// with no id anywhere inside it, so a TOC/nav link to that id has nothing to
+/// resolve to unless the first content element inside the wrapper claims the
+/// wrapper's id too.
+fn ancestor_element_ids(elem: ElementRef) -> Vec<String> {
+    let mut ids = Vec::new();
+    for ancestor in elem.ancestors() {
+        let Some(el) = ElementRef::wrap(ancestor) else { continue };
+        if el.value().name().eq_ignore_ascii_case("body") {
+            break;
+        }
+        if let Some(id) = el.value().attr("id").or_else(|| el.value().attr("name")) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
 /// Recursively builds the structured item tree for a `<ul>`/`<ol>`: each
 /// `<li>`'s own text/spans (stopping at any nested sublist boundary), plus
 /// that sublist — if present — built the same way.
@@ -804,7 +835,10 @@ pub fn parse_chapter_html(
     };
 
     let element_selector = Selector::parse(
-        "h1, h2, h3, h4, h5, h6, p, blockquote, ul, ol, img, hr, table, svg image"
+        "h1, h2, h3, h4, h5, h6, p, blockquote, ul, ol, img, hr, table, svg image, div"
+    ).unwrap();
+    let block_selector = Selector::parse(
+        "div, p, h1, h2, h3, h4, h5, h6, ul, ol, table, blockquote"
     ).unwrap();
 
     let mut elements = Vec::new();
@@ -813,11 +847,18 @@ pub fn parse_chapter_html(
 
     for elem in body.select(&element_selector) {
         let tag = elem.value().name().to_lowercase();
-        let element_id = elem
+        // EPUBs commonly wrap each addressable unit (a canto, a scene) in a
+        // `<section id="...">` with no id anywhere inside it — TOC/nav links
+        // point straight at that wrapper id, so the first content element
+        // inside it needs to answer to it too, not just its own id (if any).
+        let mut element_ids: Vec<String> = elem
             .value()
             .attr("id")
             .or_else(|| elem.value().attr("name"))
-            .map(|s| s.to_string());
+            .map(|s| s.to_string())
+            .into_iter()
+            .collect();
+        element_ids.extend(ancestor_element_ids(elem));
 
         // 1. Standalone Images (HTML <img> and SVG <image>)
         if tag == "img" || tag == "image" {
@@ -835,7 +876,7 @@ pub fn parse_chapter_html(
                     src: src_val.to_string(),
                     alt,
                     caption,
-                    element_id,
+                    element_ids,
                 });
             }
             continue;
@@ -843,7 +884,7 @@ pub fn parse_chapter_html(
 
         // 2. Thematic breaks (<hr>)
         if tag == "hr" {
-            elements.push(ChapterElement::ThematicBreak { element_id });
+            elements.push(ChapterElement::ThematicBreak { element_ids });
             continue;
         }
 
@@ -875,7 +916,7 @@ pub fn parse_chapter_html(
                 text: plain_text,
                 rows,
                 source_file: chapter_path.to_string(),
-                element_id,
+                element_ids,
             });
             continue;
         }
@@ -889,7 +930,7 @@ pub fn parse_chapter_html(
                         level,
                         text,
                         spans,
-                        element_id,
+                        element_ids,
                     });
                 }
                 continue;
@@ -915,9 +956,20 @@ pub fn parse_chapter_html(
                     spans,
                     items: build_list_items(elem),
                     source_file: chapter_path.to_string(),
-                    element_id,
+                    element_ids,
                 });
             }
+            continue;
+        }
+
+        // 5.5. Leaf <div> paragraphs — vintage EPUB2 books that never use
+        // <p> at all, marking every paragraph as a styled <div> instead.
+        // A disqualified div (a structural wrapper, or one already owned by
+        // a list item) is skipped here; a qualifying one just falls through
+        // to the paragraph handling below exactly like a <p> would.
+        if tag == "div"
+            && (!is_leaf_content_div(elem, &block_selector) || is_nested_in_list_item(elem))
+        {
             continue;
         }
 
@@ -998,7 +1050,7 @@ pub fn parse_chapter_html(
                 spans,
                 source_file: chapter_path.to_string(),
                 footnotes,
-                element_id,
+                element_ids,
                 stanza_start,
                 verse_end,
             });
