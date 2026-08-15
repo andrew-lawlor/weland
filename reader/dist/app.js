@@ -13,6 +13,39 @@ function assetUrl(assetId) {
   return `weland-asset://asset/${assetId}?b=${encodeURIComponent(currentBook.path)}`;
 }
 
+// Native window.confirm() is a silent no-op on Tauri's Linux (webkit2gtk)
+// backend — it never wires up the WebKit script-dialog signal needed to
+// actually show it — so destructive actions need this custom modal instead.
+function showConfirm(message, { title = 'Are you sure?', confirmLabel = 'Confirm' } = {}) {
+  return new Promise((resolve) => {
+    const modal = document.getElementById('confirmModal');
+    const okBtn = document.getElementById('confirmOk');
+    const cancelBtn = document.getElementById('confirmCancel');
+    document.getElementById('confirmTitle').textContent = title;
+    document.getElementById('confirmMessage').textContent = message;
+    okBtn.textContent = confirmLabel;
+    modal.hidden = false;
+
+    function cleanup(result) {
+      modal.hidden = true;
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      modal.removeEventListener('click', onBackdrop);
+      document.removeEventListener('keydown', onKey);
+      resolve(result);
+    }
+    function onOk() { cleanup(true); }
+    function onCancel() { cleanup(false); }
+    function onBackdrop(e) { if (e.target === modal) cleanup(false); }
+    function onKey(e) { if (e.key === 'Escape') cleanup(false); }
+
+    okBtn.addEventListener('click', onOk);
+    cancelBtn.addEventListener('click', onCancel);
+    modal.addEventListener('click', onBackdrop);
+    document.addEventListener('keydown', onKey);
+  });
+}
+
 let nodeElById = new Map();
 let nodeDataById = new Map();
 let annotationsByNode = new Map();
@@ -196,6 +229,7 @@ function renderAnnotationMarks(nodeWrapperEl, nodeId) {
 
     const pop = document.createElement('div');
     pop.className = 'popover';
+    pop.dataset.annId = String(ann.id);
     pop.style.top = `${top + 1.7}em`;
 
     const author = document.createElement('div');
@@ -243,7 +277,12 @@ function renderAnnotationMarks(nodeWrapperEl, nodeId) {
     delBtn.textContent = 'Delete';
     delBtn.addEventListener('click', async (e) => {
       e.preventDefault();
-      if (!confirm(`Delete this ${(KIND_LABELS[ann.annotation_type] || 'annotation').toLowerCase()}?`)) return;
+      const kind = (KIND_LABELS[ann.annotation_type] || 'annotation').toLowerCase();
+      const ok = await showConfirm(`Delete this ${kind}? This can't be undone.`, {
+        title: 'Delete annotation',
+        confirmLabel: 'Delete',
+      });
+      if (!ok) return;
       try {
         await invoke('delete_annotation', { id: ann.id });
         removeAnnotationLocally(ann.id, ann.node_id);
@@ -257,6 +296,36 @@ function renderAnnotationMarks(nodeWrapperEl, nodeId) {
 
     nodeWrapperEl.appendChild(btn);
     nodeWrapperEl.appendChild(pop);
+  });
+
+  attachInlineMarkHover(nodeWrapperEl);
+}
+
+// The inline <mark class="ann-mark"> wrapping the annotated text lives far
+// from its .popover in the DOM (the popover is only ever adjacent to its
+// .gmark gutter dot), so the gutter's plain CSS `:hover + .popover` trick
+// can't reach it. Wire it up in JS instead, reusing the exact same popover
+// element rather than building a second popup style. A short close delay
+// lets the pointer travel from the (possibly distant) highlighted text over
+// to the gutter popover to click Edit/Delete without it vanishing first.
+function attachInlineMarkHover(nodeWrapperEl) {
+  let closeTimer = null;
+  const open = (pop) => {
+    clearTimeout(closeTimer);
+    pop.classList.add('popover-open');
+  };
+  const scheduleClose = (pop) => {
+    clearTimeout(closeTimer);
+    closeTimer = setTimeout(() => pop.classList.remove('popover-open'), 250);
+  };
+
+  nodeWrapperEl.querySelectorAll('.ann-mark[data-ann-id]').forEach((mark) => {
+    const pop = nodeWrapperEl.querySelector(`.popover[data-ann-id="${mark.dataset.annId}"]`);
+    if (!pop) return;
+    mark.addEventListener('mouseenter', () => open(pop));
+    mark.addEventListener('mouseleave', () => scheduleClose(pop));
+    pop.addEventListener('mouseenter', () => open(pop));
+    pop.addEventListener('mouseleave', () => scheduleClose(pop));
   });
 }
 
@@ -715,7 +784,11 @@ function renderLibrary(filterText) {
     removeBtn.textContent = '×';
     removeBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
-      if (!confirm(`Remove "${book.title}" from your library? The file itself won't be touched.`)) return;
+      const ok = await showConfirm(`Remove "${book.title}" from your library? The file itself won't be touched.`, {
+        title: 'Remove from library',
+        confirmLabel: 'Remove',
+      });
+      if (!ok) return;
       try {
         await invoke('remove_from_library', { path: book.path });
         libraryBooks = libraryBooks.filter((b) => b.path !== book.path);

@@ -589,7 +589,6 @@ pub fn parse_nav_xhtml(nav_xhtml: &str, nav_dir: &str) -> Vec<RawTocItem> {
 fn parse_html_toc_list(list_elem: scraper::ElementRef, nav_dir: &str) -> Vec<RawTocItem> {
     let mut items = Vec::new();
     let a_selector = scraper::Selector::parse("a").unwrap();
-    let sublist_selector = scraper::Selector::parse("ol, ul").unwrap();
 
     for child in list_elem.children() {
         if let Some(li) = scraper::ElementRef::wrap(child) {
@@ -609,10 +608,20 @@ fn parse_html_toc_list(list_elem: scraper::ElementRef, nav_dir: &str) -> Vec<Raw
                 li.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ")
             };
 
+            // Only recurse into `ol`/`ul` that are direct children of this `li`.
+            // `li.select(...)` matches *any* descendant, not just direct children,
+            // so on a TOC nested three-plus levels deep (e.g. Part > Book >
+            // Chapter) it would also pick up each grandchild sublist and parse it
+            // a second time as if it were a flat, direct child of this `li` too —
+            // duplicating every chapter into the TOC tree at each ancestor level.
             let mut children = Vec::new();
-            for sublist in li.select(&sublist_selector) {
-                // Parse nested list if it's a child of this li
-                children.extend(parse_html_toc_list(sublist, nav_dir));
+            for child in li.children() {
+                if let Some(sublist) = scraper::ElementRef::wrap(child) {
+                    let name = sublist.value().name();
+                    if name.eq_ignore_ascii_case("ol") || name.eq_ignore_ascii_case("ul") {
+                        children.extend(parse_html_toc_list(sublist, nav_dir));
+                    }
+                }
             }
 
             if !title.is_empty() || !href.is_empty() {
