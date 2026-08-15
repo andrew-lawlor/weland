@@ -1,11 +1,23 @@
 use anyhow::{anyhow, Context, Result};
 use percent_encoding::percent_decode_str;
-use roxmltree::Document;
+use roxmltree::{Document, ParsingOptions};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use zip::ZipArchive;
+
+/// `Document::parse` rejects any XML containing a `<!DOCTYPE>` declaration by
+/// default — but a `<!DOCTYPE ncx ...>` line is required boilerplate in
+/// every spec-compliant EPUB2 NCX file, so that default silently failed TOC
+/// extraction on real-world books (the "generate from headings" fallback
+/// masked this for books that happened to have real heading tags; books
+/// with none, like The Odyssey, ended up with no TOC at all). `allow_dtd`
+/// doesn't add any real risk here — we don't resolve custom DTD entities,
+/// and roxmltree's billion-laughs protection applies regardless of this flag.
+fn parse_xml_permissive(xml: &str) -> Result<Document<'_>, roxmltree::Error> {
+    Document::parse_with_options(xml, ParsingOptions { allow_dtd: true, ..ParsingOptions::default() })
+}
 
 /// Represents an item in the EPUB manifest.
 #[derive(Debug, Clone)]
@@ -206,7 +218,7 @@ impl EpubArchive {
         let container_xml = Self::read_archive_string(archive, "META-INF/container.xml")
             .context("Invalid EPUB: META-INF/container.xml missing or unreadable")?;
 
-        let doc = Document::parse(&container_xml)
+        let doc = parse_xml_permissive(&container_xml)
             .context("Failed to parse META-INF/container.xml as valid XML")?;
 
         let rootfile_node = doc
@@ -226,7 +238,7 @@ impl EpubArchive {
         opf_xml: &str,
         opf_dir: &str,
     ) -> Result<(EpubMetadata, HashMap<String, ManifestItem>, Vec<String>)> {
-        let doc = Document::parse(opf_xml).context("Failed to parse OPF package document as valid XML")?;
+        let doc = parse_xml_permissive(opf_xml).context("Failed to parse OPF package document as valid XML")?;
 
         // Metadata extraction
         let mut title = None;
@@ -639,7 +651,7 @@ fn parse_html_toc_list(list_elem: scraper::ElementRef, nav_dir: &str) -> Vec<Raw
 
 /// Parses an EPUB 2 NCX document (`toc.ncx`) into hierarchical `RawTocItem`s.
 pub fn parse_toc_ncx(ncx_xml: &str, ncx_dir: &str) -> Vec<RawTocItem> {
-    let doc = match Document::parse(ncx_xml) {
+    let doc = match parse_xml_permissive(ncx_xml) {
         Ok(d) => d,
         Err(_) => return Vec::new(),
     };
