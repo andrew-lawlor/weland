@@ -329,8 +329,32 @@ pub fn extract_text_and_spans(element: ElementRef) -> TextAndSpans {
                     if tag == "a" {
                         if let Some(href) = el_data.attr("href") {
                             if href.contains('#') {
-                                // Skip internal footnote link from main text
-                                continue;
+                                // Only skip anchors that actually look like footnote
+                                // markers (explicit noteref/footnote class, or short
+                                // numeric/symbol text like "1" or "†") — NOT any
+                                // internally-linked anchor. Some EPUBs (e.g. Calibre
+                                // conversions) wrap entire chapter headings in a
+                                // self-referencing `<a href="...#chap-1">`; treating
+                                // every `#` href as a footnote marker silently deleted
+                                // those headings' text entirely.
+                                let is_noteref_class = el_data
+                                    .attr("class")
+                                    .map(|c| c.contains("footnote") || c.contains("noteref"))
+                                    .unwrap_or(false);
+                                let looks_like_marker = ElementRef::wrap(child)
+                                    .map(|a_el| {
+                                        let marker_text: String = a_el.text().collect();
+                                        let trimmed = marker_text.trim();
+                                        !trimmed.is_empty()
+                                            && trimmed.chars().count() <= 3
+                                            && trimmed
+                                                .chars()
+                                                .all(|c| c.is_ascii_digit() || "*†‡§¶".contains(c))
+                                    })
+                                    .unwrap_or(false);
+                                if is_noteref_class || looks_like_marker {
+                                    continue;
+                                }
                             }
                         }
                     }
