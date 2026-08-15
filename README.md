@@ -1,26 +1,26 @@
 # weland
 
-*Wēland, master smith of Germanic legend — imprisoned by a king who wanted his craft kept for himself, and hamstrung so he couldn't leave. He forged himself wings from what was left, and flew free.*
+*Named for Wēland, the smith-god of Germanic legend — imprisoned for his craft, who forged himself wings from what was left and flew free.*
 
-**An archival-grade, annotation-native ebook format.**
+**An archival-grade, annotation-native ebook format — and the reader built to prove it.**
 
 ---
 
 <img width="915" height="971" alt="Badhild_in_Wielands_Schmiede" src="https://github.com/user-attachments/assets/09adf7b2-d45d-4a80-bdd6-aac341f1d9ba" />
 
-## The problem
+## Why weland
 
-A paper book carries the mark of every hand that worked it over — an underlined passage, a name in the front cover, a margin note a kid finds years later and reads twice: once for the words, once for the hand that wrote them. That mark *is* the book.
+EPUB simulates paper — pages, spines, reflowable text. What it never simulated is the mark a reader leaves behind: a highlight, a margin note, a voice memo pinned to the line that mattered. Every app bolts that on as a private sidecar, tied to one account and one device, gone the moment you switch readers.
 
-EPUB never made room for that. It simulates paper — pages, spines, reflowable text — but the annotations you leave today live in a proprietary silo, tied to one app, one account, one device. Sealed shut the moment you write them. The format never asked what happens to the work a reader puts into a book. weland is the answer.
+weland fixes this at the format level, not the app level. Every book compiles to one self-contained SQLite file — the same container format the Library of Congress already trusts for long-term preservation. Text is a structured, queryable AST, not flowed HTML. Annotations are first-class rows sitting next to the text they anchor to, addressed by Unicode offset so they survive reflow, font changes, even a structural revision of the book itself. A library becomes queryable — full-text search, cross-references — with no app quietly maintaining a shadow database to fake what the format should do natively.
 
-## The idea
+**This isn't a pitch to replace EPUB as an authoring format.** Publishing happens in EPUB — that's where the tools and the whole industry already live, and weland fully supports converting from it. What weland replaces is what happens *after* a book is finished: the artifact you actually read, own, and mark up. `weland compile` turns an EPUB into a `.wld` the same way a compiler turns source into a binary — you don't hand-author the output, you author the source and let the build step add the value.
 
-Every book compiles to a single self-contained SQLite file — no external deps, the same container format the Library of Congress already trusts for long-term digital preservation. Text isn't flowed HTML, it's a structured, queryable AST. Annotations — highlights, notes, a reader's own voice pinned to the exact words that moved them — aren't a sidecar an app maintains behind your back. They're first-class rows next to the text they anchor to, precise enough to survive reflow, font changes, even a structural revision of the book itself.
+## Why weland reader
 
-That one choice changes what a book can be. A library becomes queryable — full-text search, cross-references, structure — with no app secretly building its own shadow database just to do what the format should've done. And a book becomes something you can actually hand down: a parent's marginalia, still anchored to the right words, in the copy their kid inherits.
+`reader/` is the reference client — proof the format isn't just a spec on paper. Open a `.wld`, or import an EPUB directly, and get a full desktop reading app: highlights, text notes, recorded voice notes, a searchable multi-book library — none of it locked behind an account you don't control. Every annotation is a row in a file sitting on your disk; back it up, move it, hand it to someone.
 
-The name isn't decorative. Weland forged his own way out of a cage built to keep his craft captive. A book compiled to `.wld` carries the marks of everyone who ever worked on it — unlocked, and passed on.
+It's a Tauri v2 app with a plain HTML/JS frontend — no bundler, no npm toolchain — and it's built sandboxed-by-default with explicit export on demand, specifically so it can ship as a real Flatpak on Flathub and on Steam, not just run from source.
 
 ## Quickstart
 
@@ -33,8 +33,6 @@ weland search book.wld "a phrase"     # FTS5 full-text search
 weland extract book.wld --out-dir ./assets
 weland export book.wld --format markdown   # or json / text
 ```
-
-A reference reader client — open, browse, search, and annotate a `.wld` with highlights, text notes, and recorded voice notes — lives in `reader/`. It's a Tauri desktop app with no JS bundler:
 
 ```sh
 cd reader/src-tauri
@@ -109,17 +107,14 @@ erDiagram
 
 ## Who this is for
 
-Not aimed at dethroning EPUB by force of adoption — built for the people EPUB was never built for:
-
 - **Indie ereader devs** who'd rather get structure, search, and annotation storage for free than reimplement all three, badly, on top of styled HTML.
 - **DRM-free publishers and small presses** who want their books to actually belong to their readers.
 - **Archivists and librarians** who want a format built on a container already trusted for long-term preservation.
 - **Researchers, language learners, book clubs, serious annotators** — anyone for whom a book is a conversation, not a one-way read.
-- **Anyone who's ever wanted to hand a book to someone they love, thoughts and all.**
 
 ## What this is not
 
-Not commercially driven, not chasing EPUB's install base. It exists because the problem is real, the fix is possible, and it's worth building well — a format designed the way a craftsperson builds a tool meant to outlast them.
+Not a pitch to dethrone EPUB's install base, and not an authoring format — write in EPUB, read and own in weland. Built because the problem is real, the fix is possible, and it's worth building well: a format made the way a craftsperson builds a tool meant to outlast them.
 
 ---
 
