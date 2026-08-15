@@ -341,6 +341,31 @@ pub fn compile_epub<P: AsRef<Path>, Q: AsRef<Path>>(
                         ordinal += 1;
                     }
 
+                    ChapterElement::List { ordered, text, spans, items, source_file, element_id } => {
+                        let attrs = json!({
+                            "ordered": ordered,
+                            "items": items,
+                            "spans": spans,
+                            "source_file": source_file
+                        });
+
+                        let node_id: i64 = stmt_node.query_row(
+                            params![None::<i64>, ordinal, "list", &text, attrs.to_string()],
+                            |row| row.get(0),
+                        )?;
+
+                        stmt_fts.execute(params![node_id, &text])?;
+                        *node_counts.entry("list".to_string()).or_insert(0) += 1;
+
+                        if !chapter_first_node_map.contains_key(chapter_path) {
+                            chapter_first_node_map.insert(chapter_path.clone(), node_id);
+                        }
+                        if let Some(ref el_id) = element_id {
+                            element_id_map.insert((chapter_path.clone(), el_id.clone()), node_id);
+                        }
+                        ordinal += 1;
+                    }
+
                     ChapterElement::Image { src, alt, caption, element_id } => {
                         let full_img_path = resolve_relative_path(&chapter_dir, &src);
                         if let Ok(img_bytes) = epub.read_bytes(&full_img_path) {

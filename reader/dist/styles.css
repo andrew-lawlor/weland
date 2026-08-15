@@ -794,7 +794,16 @@ blockquote.node-text {
   color: var(--muted);
   font-style: italic;
 }
-.node-list { padding-left: 1.3rem; }
+.node-list {
+  padding-left: 1.3rem;
+  margin: 0 0 1.25rem;
+  font-family: var(--read-font);
+  font-size: 1em;
+  line-height: var(--read-leading);
+}
+.node-list li { margin: 0 0 0.4rem; }
+.node-list li:last-child { margin-bottom: 0; }
+.node-list .node-list { margin: 0.4rem 0 0; }
 
 .node em { font-style: italic; }
 .node strong { font-weight: 700; }

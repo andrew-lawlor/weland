@@ -1,5 +1,6 @@
 use crate::schema::Span;
 use scraper::{ElementRef, Html, Node, Selector};
+use serde::Serialize;
 
 /// Result of extracting normalized text and inline formatting spans from a DOM subtree.
 #[derive(Debug, Clone, Default)]
@@ -40,6 +41,32 @@ pub enum ChapterElement {
         caption: String,
         element_id: Option<String>,
     },
+    List {
+        ordered: bool,
+        text: String,
+        spans: Vec<Span>,
+        items: Vec<ListItem>,
+        source_file: String,
+        element_id: Option<String>,
+    },
+}
+
+/// A nested, ordered/unordered list, as found either at the top level of a
+/// chapter or inside a single `<li>` (a sublist).
+#[derive(Debug, Clone, Serialize)]
+pub struct ListNode {
+    pub ordered: bool,
+    pub items: Vec<ListItem>,
+}
+
+/// A single `<li>`: its own inline text/spans (not including any nested
+/// sublist's text), plus that sublist if it has one.
+#[derive(Debug, Clone, Serialize)]
+pub struct ListItem {
+    pub text: String,
+    pub spans: Vec<Span>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sublist: Option<Box<ListNode>>,
 }
 
 /// Represents a reference to a footnote found inside a block element.
@@ -290,6 +317,18 @@ impl TextCollector {
 /// Recursively walks a DOM subtree to extract plain text with collapsed whitespace
 /// and precise inline span character ranges.
 pub fn extract_text_and_spans(element: ElementRef) -> TextAndSpans {
+    extract_text_and_spans_opts(element, false)
+}
+
+/// Same as `extract_text_and_spans`, but stops at a nested `<ul>`/`<ol>` boundary
+/// instead of walking into it. Used to get a single `<li>`'s own text without
+/// also absorbing its sublist's text (which is extracted separately, into its
+/// own nested `ListItem`s, by `build_list_items`).
+fn extract_list_item_text(element: ElementRef) -> TextAndSpans {
+    extract_text_and_spans_opts(element, true)
+}
+
+fn extract_text_and_spans_opts(element: ElementRef, stop_at_lists: bool) -> TextAndSpans {
     let mut collector = TextCollector::new();
     let mut raw_spans: Vec<Span> = Vec::new();
 
@@ -297,6 +336,7 @@ pub fn extract_text_and_spans(element: ElementRef) -> TextAndSpans {
         node_ref: ElementRef,
         collector: &mut TextCollector,
         raw_spans: &mut Vec<Span>,
+        stop_at_lists: bool,
     ) {
         for child in node_ref.children() {
             match child.value() {
@@ -305,6 +345,10 @@ pub fn extract_text_and_spans(element: ElementRef) -> TextAndSpans {
                 }
                 Node::Element(el_data) => {
                     let tag = el_data.name().to_lowercase();
+
+                    if stop_at_lists && (tag == "ul" || tag == "ol") {
+                        continue;
+                    }
 
                     // Ignore inner footnote anchor tags in text calculation (handled separately)
                     if tag == "sup" {
@@ -363,7 +407,7 @@ pub fn extract_text_and_spans(element: ElementRef) -> TextAndSpans {
                     let start = collector.char_len();
 
                     if let Some(child_el) = ElementRef::wrap(child) {
-                        walk(child_el, collector, raw_spans);
+                        walk(child_el, collector, raw_spans, stop_at_lists);
                     }
 
                     let end = collector.char_len();
@@ -400,7 +444,7 @@ pub fn extract_text_and_spans(element: ElementRef) -> TextAndSpans {
         }
     }
 
-    walk(element, &mut collector, &mut raw_spans);
+    walk(element, &mut collector, &mut raw_spans, stop_at_lists);
 
     let (text, final_len) = collector.finish();
 
@@ -422,6 +466,59 @@ pub fn extract_text_and_spans(element: ElementRef) -> TextAndSpans {
         text,
         spans: clean_spans,
     }
+}
+
+/// True if `elem` sits inside some other list's `<li>` — i.e. it's a sublist,
+/// not a top-level list in its own right.
+fn is_nested_in_list_item(elem: ElementRef) -> bool {
+    for ancestor in elem.ancestors() {
+        if let Some(el) = ElementRef::wrap(ancestor) {
+            let name = el.value().name();
+            if name.eq_ignore_ascii_case("li") {
+                return true;
+            }
+            if name.eq_ignore_ascii_case("body") {
+                return false;
+            }
+        }
+    }
+    false
+}
+
+/// Recursively builds the structured item tree for a `<ul>`/`<ol>`: each
+/// `<li>`'s own text/spans (stopping at any nested sublist boundary), plus
+/// that sublist — if present — built the same way.
+fn build_list_items(list_elem: ElementRef) -> Vec<ListItem> {
+    let mut items = Vec::new();
+
+    for child in list_elem.children() {
+        let Some(li) = ElementRef::wrap(child) else { continue };
+        if !li.value().name().eq_ignore_ascii_case("li") {
+            continue;
+        }
+
+        let TextAndSpans { text, spans } = extract_list_item_text(li);
+
+        let mut sublist: Option<Box<ListNode>> = None;
+        for sub_child in li.children() {
+            if let Some(sub_el) = ElementRef::wrap(sub_child) {
+                let sub_tag = sub_el.value().name();
+                if sub_tag.eq_ignore_ascii_case("ul") || sub_tag.eq_ignore_ascii_case("ol") {
+                    sublist = Some(Box::new(ListNode {
+                        ordered: sub_tag.eq_ignore_ascii_case("ol"),
+                        items: build_list_items(sub_el),
+                    }));
+                    break;
+                }
+            }
+        }
+
+        if !text.is_empty() || sublist.is_some() {
+            items.push(ListItem { text, spans, sublist });
+        }
+    }
+
+    items
 }
 
 /// Parses an HTML/XHTML chapter document into a structured list of ChapterElements.
@@ -528,13 +625,37 @@ pub fn parse_chapter_html(
             }
         }
 
-        // 5. Paragraphs, Blockquotes, Lists
+        // 5. Lists (ul/ol)
+        //
+        // `body.select(&element_selector)` matches every ul/ol regardless of
+        // nesting depth, so a sublist inside another list's <li> would
+        // otherwise turn up here a second time as its own top-level list —
+        // skip it; it's already captured recursively by build_list_items
+        // below, as part of its parent item.
+        if tag == "ul" || tag == "ol" {
+            if is_nested_in_list_item(elem) {
+                continue;
+            }
+            let TextAndSpans { text, spans } = extract_text_and_spans(elem);
+            if !text.is_empty() {
+                elements.push(ChapterElement::List {
+                    ordered: tag == "ol",
+                    text,
+                    spans,
+                    items: build_list_items(elem),
+                    source_file: chapter_path.to_string(),
+                    element_id,
+                });
+            }
+            continue;
+        }
+
+        // 6. Paragraphs, Blockquotes
         let TextAndSpans { text, spans } = extract_text_and_spans(elem);
 
         if !text.is_empty() {
             let node_type = match tag.as_str() {
                 "blockquote" => "blockquote".to_string(),
-                "ul" | "ol" => "list".to_string(),
                 _ => "paragraph".to_string(),
             };
 

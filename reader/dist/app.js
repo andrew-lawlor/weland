@@ -136,6 +136,28 @@ function textNodeElement(tag, node, annotations) {
   return el;
 }
 
+// Builds a real nested <ul>/<ol>/<li> tree from a list node's structured
+// `attributes.items` (each item's own text/spans, plus an optional nested
+// sublist in the same {ordered, items} shape) — not the flattened
+// `node.content` string, which exists only for search/plain-text export.
+// Per-item highlight/annotation overlay isn't wired up here; annotations on
+// a list node anchor to that flattened content, not to individual items.
+function buildListElement(listData) {
+  const el = document.createElement(listData.ordered ? 'ol' : 'ul');
+  for (const item of (listData && listData.items) || []) {
+    const li = document.createElement('li');
+    const textEl = document.createElement('span');
+    textEl.className = 'node-text';
+    textEl.innerHTML = renderSpans(item.text, item.spans, []);
+    li.appendChild(textEl);
+    if (item.sublist) {
+      li.appendChild(buildListElement(item.sublist));
+    }
+    el.appendChild(li);
+  }
+  return el;
+}
+
 function renderNode(node, extraRanges) {
   const annotations = annotationRanges(node.id).concat(extraRanges || []);
   const wrapper = document.createElement('div');
@@ -153,7 +175,7 @@ function renderNode(node, extraRanges) {
       wrapper.appendChild(textNodeElement('blockquote', node, annotations));
       break;
     case 'list': {
-      const el = textNodeElement('p', node, annotations);
+      const el = buildListElement(node.attributes || {});
       el.classList.add('node-list');
       wrapper.appendChild(el);
       break;
