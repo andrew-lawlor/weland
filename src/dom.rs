@@ -703,13 +703,17 @@ fn is_nested_in_list_item(elem: ElementRef) -> bool {
     false
 }
 
-/// True if `elem` (a `<div>`) contains no nested block-level element — i.e.
-/// it holds only inline content (text, spans, links, `<br>`) and should be
-/// treated as a paragraph-equivalent leaf, not a structural wrapper.
-/// Vintage EPUB2 conversions often mark every paragraph as
-/// `<div class="...">` instead of `<p>`; a wrapper div containing those leaf
-/// divs must NOT also be treated as one giant paragraph, or its children's
-/// text would be captured twice.
+/// True if `elem` contains no nested block-level element — i.e. it holds
+/// only inline content (text, spans, links, `<br>`) and should be treated as
+/// a paragraph-equivalent leaf, not a structural wrapper. Used for two
+/// unrelated wrapper patterns: vintage EPUB2 conversions that mark every
+/// paragraph as `<div class="...">` instead of `<p>` (a wrapper div
+/// containing those leaf divs must NOT also be treated as one giant
+/// paragraph), and books that wrap each verse line as
+/// `<blockquote><p>...</p></blockquote>` purely for CSS indentation (the
+/// wrapping blockquote must NOT also capture its child `<p>`'s text a second
+/// time). Either way, a non-leaf wrapper is skipped so its block children
+/// fall through and stand on their own.
 fn is_leaf_content_div(elem: ElementRef, block_selector: &Selector) -> bool {
     elem.select(block_selector).next().is_none()
 }
@@ -970,6 +974,19 @@ pub fn parse_chapter_html(
         if tag == "div"
             && (!is_leaf_content_div(elem, &block_selector) || is_nested_in_list_item(elem))
         {
+            continue;
+        }
+
+        // 5.6. Blockquote wrappers around block-level content — e.g.
+        // `<blockquote><p>...</p></blockquote>` repeated per verse line,
+        // used purely for CSS indentation. `body.select(&element_selector)`
+        // already matches the inner <p> as its own element (correctly
+        // classified as verse_line/paragraph); if the blockquote is also
+        // pushed as a node, its `extract_text_and_spans` recurses into that
+        // same <p> and duplicates the text. Only a blockquote with pure
+        // inline content (no nested block) is a leaf worth keeping as its
+        // own `blockquote` node.
+        if tag == "blockquote" && !is_leaf_content_div(elem, &block_selector) {
             continue;
         }
 

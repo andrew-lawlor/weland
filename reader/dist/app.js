@@ -538,6 +538,15 @@ document.getElementById('readingPane').addEventListener('scroll', () => {
 /* ================= Book loading ================= */
 
 function renderBook(book) {
+  // #readingPane is one persistent element reused across every book — cancel
+  // any scroll animation still in flight from whatever was open before
+  // (an eased smoothScrollTo jump, or a held-arrow-key that hasn't seen its
+  // keyup yet) so it can't keep nudging scrollTop after this book's content
+  // replaces the old one. Without this, closing a book mid-scroll and
+  // opening a new one can leave it opening already scrolled partway down.
+  scrollAnimId++;
+  heldScrollDirection = 0;
+
   currentBook = book;
   annotationsByNode = new Map();
   for (const ann of book.annotations) {
@@ -548,7 +557,17 @@ function renderBook(book) {
   document.getElementById('bookTitle').textContent = book.metadata.title || 'Untitled';
   document.getElementById('bookByline').textContent = book.metadata.author ? `by ${book.metadata.author}` : '';
 
-  document.getElementById('readingPane').scrollTop = 0;
+  const pane = document.getElementById('readingPane');
+  // A fast fling in the previous book can leave WebKitGTK's native kinetic
+  // scroll still animating this element's compositor-level scroll position
+  // after the switch — a plain `scrollTop = 0` doesn't reliably cancel that
+  // momentum, so the new book can end up visibly landing partway down.
+  // Toggling overflow off and back on (with a forced reflow in between)
+  // destroys that momentum state outright.
+  pane.style.overflowY = 'hidden';
+  pane.scrollTop = 0;
+  void pane.offsetHeight;
+  pane.style.overflowY = '';
 
   const article = document.getElementById('readingArticle');
   article.innerHTML = '';
@@ -575,6 +594,21 @@ function renderBook(book) {
   restoreReadingPosition(book.last_position_node_id);
   updateActiveTocEntry();
   updateAnnotationsCount(allAnnotationsInOrder());
+
+  // Safety net: if leftover kinetic momentum from the previous book is
+  // still landing a frame or two later (the overflow toggle above should
+  // normally prevent this), reassert the correct position once more after
+  // things have settled. Bails if another book was opened in the meantime.
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      if (currentBook !== book) return;
+      if (book.last_position_node_id == null) {
+        pane.scrollTop = 0;
+      } else {
+        restoreReadingPosition(book.last_position_node_id);
+      }
+    });
+  });
 }
 
 // Jumps straight to a saved position with no animation — this is restoring
@@ -868,12 +902,25 @@ function renderLibrary(filterText) {
     openBtn.disabled = !book.available;
 
     const cover = document.createElement('span');
-    if (book.cover_data_uri) {
-      cover.className = 'library-cover';
-      cover.style.backgroundImage = `url("${book.cover_data_uri}")`;
-    } else {
+    const showPlaceholder = () => {
       cover.className = 'library-cover library-cover-placeholder';
       cover.textContent = (book.title || '?').trim().charAt(0).toUpperCase();
+    };
+    if (book.available) {
+      cover.className = 'library-cover';
+      // Loaded as a plain background image request rather than embedded in
+      // list_library's response — decoding happens off the JS main thread,
+      // and a probe Image() lets us fall back to the placeholder glyph if
+      // the book has no cover (weland-cover:// 404s) without blocking on it.
+      const coverUrl = `weland-cover://cover/${encodeURIComponent(book.path)}`;
+      const probe = new Image();
+      probe.onload = () => {
+        cover.style.backgroundImage = `url("${coverUrl}")`;
+      };
+      probe.onerror = showPlaceholder;
+      probe.src = coverUrl;
+    } else {
+      showPlaceholder();
     }
 
     const title = document.createElement('span');

@@ -4,18 +4,12 @@ mod commands;
 mod dictionary;
 
 use rusqlite::Connection;
-use std::collections::HashMap;
 use std::sync::Mutex;
 use tauri::{Manager, State};
 
 pub struct AppState {
     pub db: Mutex<Option<Connection>>,
     pub dict_db: Mutex<Option<Connection>>,
-    // Cover art doesn't change once a .wld is compiled, but list_library gets
-    // called on every return to the library view — without this, that meant
-    // re-opening every book's sqlite file and re-decoding its cover blob to
-    // base64 from scratch each time, which gets slow with 100+ books.
-    pub cover_cache: Mutex<HashMap<String, Option<String>>>,
 }
 
 fn asset_response(mime: String, data: Vec<u8>) -> tauri::http::Response<Vec<u8>> {
@@ -39,7 +33,36 @@ fn not_found() -> tauri::http::Response<Vec<u8>> {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(AppState { db: Mutex::new(None), dict_db: Mutex::new(None), cover_cache: Mutex::new(HashMap::new()) })
+        .manage(AppState { db: Mutex::new(None), dict_db: Mutex::new(None) })
+        .register_uri_scheme_protocol("weland-cover", |_ctx, request| {
+            // weland-cover://cover/<percent-encoded absolute .wld path> — unlike
+            // weland-asset (scoped to whatever book is currently open), library
+            // cards need covers for every book in the library at once, so this
+            // opens each target file fresh, read-only, on demand. Letting the
+            // webview fetch these as plain <img> requests (instead of the old
+            // approach of base64-embedding every cover into list_library's JSON
+            // response) keeps that response tiny and moves image decoding off
+            // the JS main thread entirely.
+            let raw_path = request.uri().path().trim_start_matches('/');
+            let path = percent_encoding::percent_decode_str(raw_path)
+                .decode_utf8_lossy()
+                .into_owned();
+
+            let conn = match Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
+                Ok(c) => c,
+                Err(_) => return not_found(),
+            };
+            let Ok(metadata) = weland::db::load_metadata(&conn) else {
+                return not_found();
+            };
+            let Some(cover_id) = metadata.get("cover_asset_id").and_then(|s| s.parse::<i64>().ok()) else {
+                return not_found();
+            };
+            match weland::db::load_asset(&conn, cover_id) {
+                Ok((mime, data)) => asset_response(mime, data),
+                Err(_) => not_found(),
+            }
+        })
         .register_uri_scheme_protocol("weland-asset", |ctx, request| {
             let app = ctx.app_handle();
             let state: State<AppState> = app.state();

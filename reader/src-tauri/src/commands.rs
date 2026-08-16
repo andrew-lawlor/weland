@@ -371,7 +371,6 @@ pub struct LibraryBook {
     pub author: Option<String>,
     pub added_at: i64,
     pub last_opened_at: i64,
-    pub cover_data_uri: Option<String>,
     pub available: bool,
 }
 
@@ -449,49 +448,36 @@ pub fn update_reading_position(path: String, node_id: i64, app: AppHandle) -> Re
     Ok(())
 }
 
-// Opens a book's own database read-only just to pull its cover thumbnail —
-// never creates or modifies the file, so a stale/missing library path is safe.
-fn load_cover_data_uri(path: &str) -> anyhow::Result<Option<String>> {
-    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    let metadata = db::load_metadata(&conn)?;
-    let Some(cover_id_str) = metadata.get("cover_asset_id") else {
-        return Ok(None);
-    };
-    let cover_id: i64 = cover_id_str.parse()?;
-    let (mime, data) = db::load_asset(&conn, cover_id)?;
-    Ok(Some(format!("data:{};base64,{}", mime, STANDARD.encode(data))))
-}
-
+// Covers are served on demand via the weland-cover:// protocol (see main.rs)
+// instead of being embedded here as base64 — keeps this response small and
+// lets the webview load/decode cover images off its own main thread.
 #[tauri::command]
-pub fn list_library(app: AppHandle, state: State<AppState>) -> Result<Vec<LibraryBook>, String> {
-    let mut entries = read_library(&app)?;
-    entries.sort_by(|a, b| b.last_opened_at.cmp(&a.last_opened_at));
+pub async fn list_library(app: AppHandle) -> Result<Vec<LibraryBook>, String> {
+    // Reading library.json and stat-ing every book path is cheap, but it's
+    // still blocking file I/O — running it via spawn_blocking keeps it off
+    // Tauri's main thread so the window stays responsive no matter how large
+    // the library gets or how slow the underlying disk is.
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut entries = read_library(&app)?;
+        entries.sort_by(|a, b| b.last_opened_at.cmp(&a.last_opened_at));
 
-    let mut cache = state.cover_cache.lock().map_err(|e| e.to_string())?;
-
-    Ok(entries
-        .into_iter()
-        .map(|e| {
-            let available = std::path::Path::new(&e.path).exists();
-            let cover_data_uri = if available {
-                cache
-                    .entry(e.path.clone())
-                    .or_insert_with(|| load_cover_data_uri(&e.path).ok().flatten())
-                    .clone()
-            } else {
-                None
-            };
-            LibraryBook {
-                path: e.path,
-                title: e.title,
-                author: e.author,
-                added_at: e.added_at,
-                last_opened_at: e.last_opened_at,
-                cover_data_uri,
-                available,
-            }
-        })
-        .collect())
+        Ok(entries
+            .into_iter()
+            .map(|e| {
+                let available = std::path::Path::new(&e.path).exists();
+                LibraryBook {
+                    path: e.path,
+                    title: e.title,
+                    author: e.author,
+                    added_at: e.added_at,
+                    last_opened_at: e.last_opened_at,
+                    available,
+                }
+            })
+            .collect())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
