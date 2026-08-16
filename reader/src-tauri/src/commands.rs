@@ -389,6 +389,11 @@ struct LibraryEntry {
     last_opened_at: i64,
     #[serde(default)]
     last_position_node_id: Option<i64>,
+    // 0.0-1.0 fraction through the book's content, by character count up to
+    // last_position_node_id — computed client-side (the frontend already
+    // has every node's content loaded) and passed alongside the node id.
+    #[serde(default)]
+    last_position_percent: Option<f64>,
 }
 
 #[derive(serde::Serialize)]
@@ -399,6 +404,7 @@ pub struct LibraryBook {
     pub added_at: i64,
     pub last_opened_at: i64,
     pub available: bool,
+    pub last_position_percent: Option<f64>,
 }
 
 fn library_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -443,6 +449,7 @@ fn upsert_library_entry(app: &AppHandle, path: &str, title: &str, author: Option
             added_at: now,
             last_opened_at: now,
             last_position_node_id: None,
+            last_position_percent: None,
         });
     }
     write_library(app, &entries)
@@ -460,16 +467,18 @@ fn clear_last_position(app: &AppHandle, path: &str) {
     if let Ok(mut entries) = read_library(app) {
         if let Some(existing) = entries.iter_mut().find(|e| e.path == path) {
             existing.last_position_node_id = None;
+            existing.last_position_percent = None;
             let _ = write_library(app, &entries);
         }
     }
 }
 
 #[tauri::command]
-pub fn update_reading_position(path: String, node_id: i64, app: AppHandle) -> Result<(), String> {
+pub fn update_reading_position(path: String, node_id: i64, percent: f64, app: AppHandle) -> Result<(), String> {
     let mut entries = read_library(&app)?;
     if let Some(existing) = entries.iter_mut().find(|e| e.path == path) {
         existing.last_position_node_id = Some(node_id);
+        existing.last_position_percent = Some(percent.clamp(0.0, 1.0));
         write_library(&app, &entries)?;
     }
     Ok(())
@@ -499,6 +508,7 @@ pub async fn list_library(app: AppHandle) -> Result<Vec<LibraryBook>, String> {
                     added_at: e.added_at,
                     last_opened_at: e.last_opened_at,
                     available,
+                    last_position_percent: e.last_position_percent,
                 }
             })
             .collect())

@@ -448,6 +448,7 @@ button {
 }
 .library-card-open:disabled { cursor: not-allowed; opacity: 0.5; }
 .library-cover {
+  position: relative;
   width: 100%;
   aspect-ratio: 2 / 3;
   border-radius: 7px;
@@ -455,7 +456,25 @@ button {
   border: 1px solid var(--hairline);
   box-shadow: 0 12px 22px -14px var(--shadow);
   margin-bottom: 0.6rem;
+  overflow: hidden;
 }
+.library-progress-scrim {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 32%;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.55), transparent);
+}
+.library-progress {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.35);
+}
+.library-progress-fill { display: block; height: 100%; background: var(--accent); }
 .library-cover-placeholder {
   display: grid;
   place-items: center;
@@ -590,6 +609,12 @@ button {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.tb-progress {
+  font: 600 0.72rem/1 ui-monospace, "SF Mono", Consolas, monospace;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  flex: none;
 }
 .tb-search {
   -webkit-app-region: no-drag;

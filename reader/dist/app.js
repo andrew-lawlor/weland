@@ -5,6 +5,32 @@ const dialogApi = window.__TAURI__.dialog;
 
 let currentBook = null;
 
+// Reading progress: cumulative character count (UTF-16 code units — an
+// approximation is fine here, this is a coarse percentage, not an offset
+// that needs to survive anchoring like annotation spans do) through the
+// book's content up to and including each node, keyed by node id, plus the
+// book's total. Rebuilt once per renderBook call.
+let bookProgressCumByNode = new Map();
+let bookProgressTotal = 0;
+
+function computeProgressPercent(nodeId) {
+  if (!bookProgressTotal || nodeId == null) return null;
+  const cum = bookProgressCumByNode.get(nodeId);
+  if (cum == null) return null;
+  return Math.max(0, Math.min(1, cum / bookProgressTotal));
+}
+
+function updateBookProgressUI(nodeId) {
+  const el = document.getElementById('bookProgress');
+  const pct = computeProgressPercent(nodeId);
+  if (pct == null) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  el.textContent = `${Math.round(pct * 100)}%`;
+}
+
 // Asset row IDs only reset per-.wld file, so weland-asset://asset/<id> can point
 // at completely different bytes across books. The webview's resource cache keys
 // purely on URL, so tag the query string with the open book's path to keep the
@@ -587,13 +613,18 @@ function renderBook(book) {
   article.innerHTML = '';
   nodeElById = new Map();
   nodeDataById = new Map();
+  bookProgressCumByNode = new Map();
+  let cumLen = 0;
   for (const node of book.nodes) {
     nodeDataById.set(node.id, node);
     const el = renderNode(node);
     article.appendChild(el);
     nodeElById.set(node.id, el);
     renderAnnotationMarks(el, node.id);
+    if (node.content) cumLen += node.content.length;
+    bookProgressCumByNode.set(node.id, cumLen);
   }
+  bookProgressTotal = cumLen;
 
   renderToc(book.toc);
   tocTargets = book.nodes
@@ -606,6 +637,7 @@ function renderBook(book) {
   document.getElementById('appFrame').hidden = false;
   document.getElementById('annotationsPanel').hidden = true;
   restoreReadingPosition(book.last_position_node_id);
+  updateBookProgressUI(book.last_position_node_id);
   updateActiveTocEntry();
   updateAnnotationsCount(allAnnotationsInOrder());
 
@@ -656,12 +688,13 @@ function findTopVisibleNodeId() {
   return current.nodeId;
 }
 
-async function saveReadingPosition() {
+async function saveReadingPosition(nodeId) {
   if (!currentBook) return;
-  const nodeId = findTopVisibleNodeId();
+  if (nodeId == null) nodeId = findTopVisibleNodeId();
   if (nodeId == null) return;
+  const percent = computeProgressPercent(nodeId) ?? 0;
   try {
-    await invoke('update_reading_position', { path: currentBook.path, nodeId });
+    await invoke('update_reading_position', { path: currentBook.path, nodeId, percent });
   } catch (err) {
     console.error('Failed to save reading position', err);
   }
@@ -669,8 +702,10 @@ async function saveReadingPosition() {
 
 let positionSaveTimeout = null;
 document.getElementById('readingPane').addEventListener('scroll', () => {
+  const nodeId = findTopVisibleNodeId();
+  updateBookProgressUI(nodeId);
   clearTimeout(positionSaveTimeout);
-  positionSaveTimeout = setTimeout(saveReadingPosition, 600);
+  positionSaveTimeout = setTimeout(() => saveReadingPosition(nodeId), 600);
 });
 
 /* ================= Author name ================= */
@@ -937,6 +972,21 @@ function renderLibrary(filterText) {
       showPlaceholder();
     }
 
+    if (book.available && book.last_position_percent != null) {
+      // A scrim behind the bar guarantees contrast no matter what's in the
+      // cover art at that spot — a plain thin bar was getting lost against
+      // busy/dark covers, especially at low percentages.
+      const scrim = document.createElement('span');
+      scrim.className = 'library-progress-scrim';
+      const progress = document.createElement('span');
+      progress.className = 'library-progress';
+      const fill = document.createElement('span');
+      fill.className = 'library-progress-fill';
+      fill.style.width = `${Math.round(Math.max(0, Math.min(1, book.last_position_percent)) * 100)}%`;
+      progress.appendChild(fill);
+      cover.append(scrim, progress);
+    }
+
     const title = document.createElement('span');
     title.className = 'library-title';
     title.textContent = book.title || 'Untitled';
@@ -1013,7 +1063,8 @@ document.getElementById('librarySearch').addEventListener('input', (e) => {
 
 document.getElementById('libraryBtn').addEventListener('click', () => {
   clearTimeout(positionSaveTimeout);
-  saveReadingPosition();
+  const nodeId = findTopVisibleNodeId();
+  saveReadingPosition(nodeId);
   document.getElementById('appFrame').hidden = true;
   document.getElementById('emptyState').hidden = false;
 
@@ -1028,6 +1079,8 @@ document.getElementById('libraryBtn').addEventListener('click', () => {
   const existing = path && libraryBooks.find((b) => b.path === path);
   if (existing) {
     existing.last_opened_at = Math.floor(Date.now() / 1000);
+    const percent = computeProgressPercent(nodeId);
+    if (percent != null) existing.last_position_percent = percent;
     libraryBooks.sort((a, b) => b.last_opened_at - a.last_opened_at);
     renderLibrary(document.getElementById('librarySearch').value.trim());
   } else {
