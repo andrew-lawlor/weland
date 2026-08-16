@@ -192,3 +192,84 @@ fn resample_linear(input: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn resample_linear_is_noop_at_same_rate() {
+        let input = vec![1, -2, 3, -4, 5];
+        assert_eq!(resample_linear(&input, 48000, 48000), input);
+    }
+
+    #[test]
+    fn resample_linear_handles_empty_input() {
+        assert_eq!(resample_linear(&[], 44100, 48000), Vec::<i16>::new());
+    }
+
+    #[test]
+    fn resample_linear_upsamples_to_expected_length() {
+        let input: Vec<i16> = (0..1000).map(|i| (i % 100) as i16).collect();
+        let out = resample_linear(&input, 24000, 48000);
+        // Exactly doubling the rate should exactly double the sample count.
+        assert_eq!(out.len(), input.len() * 2);
+    }
+
+    #[test]
+    fn resample_linear_downsamples_to_expected_length() {
+        let input: Vec<i16> = (0..1000).map(|i| (i % 100) as i16).collect();
+        let out = resample_linear(&input, 48000, 24000);
+        assert_eq!(out.len(), input.len() / 2);
+    }
+
+    #[test]
+    fn resample_linear_interpolates_smoothly() {
+        // A straight ramp resampled should stay smooth — no interpolated
+        // sample should jump by more than one step between neighbors.
+        let input: Vec<i16> = (0..100).collect();
+        let out = resample_linear(&input, 48000, 96000);
+        assert_eq!(out.len(), 200);
+        for w in out.windows(2) {
+            assert!((w[1] - w[0]).abs() <= 1, "unexpected jump between adjacent resampled values: {w:?}");
+        }
+    }
+
+    #[test]
+    fn encode_pipeline_produces_valid_decodable_ogg_opus() {
+        // Synthesize ~0.5s of a 440Hz tone at 44100Hz mono — a realistic
+        // stand-in for a real mic capture at a common native rate that
+        // isn't already 48kHz, so this also exercises resampling.
+        let sample_rate = 44100u32;
+        let n = (f64::from(sample_rate) * 0.5) as usize;
+        let samples: Vec<i16> = (0..n)
+            .map(|i| {
+                let t = i as f64 / f64::from(sample_rate);
+                ((t * 440.0 * std::f64::consts::TAU).sin() * f64::from(i16::MAX) * 0.5) as i16
+            })
+            .collect();
+
+        let resampled = resample_linear(&samples, sample_rate, 48000);
+        let ogg = ogg_opus::encode::<48000, 1>(&resampled).expect("encode should succeed");
+
+        assert!(ogg.starts_with(b"OggS"), "output should start with the Ogg capture pattern");
+        assert!(
+            ogg.len() < samples.len() * 2,
+            "opus output ({} bytes) should be much smaller than raw 16-bit PCM ({} bytes)",
+            ogg.len(),
+            samples.len() * 2
+        );
+
+        let (decoded, _) = ogg_opus::decode::<_, 48000>(Cursor::new(ogg)).expect("round-trip decode should succeed");
+        assert!(!decoded.is_empty());
+        // Roughly the same duration back out, allowing for Opus's pre-skip
+        // priming/trailing padding rather than an exact sample count match.
+        let expected_len = resampled.len();
+        assert!(
+            decoded.len() > expected_len / 2 && decoded.len() < expected_len * 2,
+            "decoded length {} should be roughly comparable to encoded input length {expected_len}",
+            decoded.len(),
+        );
+    }
+}
