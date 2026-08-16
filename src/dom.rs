@@ -499,6 +499,17 @@ fn extract_text_and_spans_opts(element: ElementRef, stop_at_lists: bool) -> Text
     }
 }
 
+/// The longest individual `\n`-separated line within `text` — used instead
+/// of total length so a `<p>` that groups several `<br>`-joined poetic
+/// lines into one block (a convention some verse translations use instead
+/// of one `<p>` per line — e.g. Ringler's Beowulf groups a whole clause
+/// into one `<p>`, `<br>`-separated, often nine lines at a time) is judged
+/// by how long its lines actually are, not by how many of them got glued
+/// together.
+fn max_sub_line_len(text: &str) -> usize {
+    text.split('\n').map(|line| line.chars().count()).max().unwrap_or(0)
+}
+
 /// Some EPUBs (e.g. this book's publisher) mark up verse as one `<p>` per
 /// line with no distinguishing class name or semantic marker at all — just
 /// generic classes shared with ordinary prose paragraphs. There's no
@@ -556,9 +567,12 @@ fn detect_verse_paragraphs(body: ElementRef) -> (Vec<bool>, Vec<bool>, Vec<bool>
         .map(|p| {
             let TextAndSpans { text, spans } = extract_text_and_spans(p);
             let len = text.chars().count();
+            let longest_line = max_sub_line_len(&text);
             Entry {
                 parent: p.parent().and_then(ElementRef::wrap),
-                is_short: len > 0 && len <= SHORT_LEN,
+                is_short: longest_line > 0
+                    && longest_line <= SHORT_LEN
+                    && !is_in_non_narrative_backmatter(p),
                 is_empty: len == 0,
                 is_disqualifying: starts_with_opening_quote(&text) || is_whole_line_link(len, &spans),
                 starts_with_number: leading_number_len(&text).is_some(),
@@ -643,6 +657,33 @@ fn detect_verse_paragraphs(body: ElementRef) -> (Vec<bool>, Vec<bool>, Vec<bool>
     (is_verse, is_stanza_start, is_verse_end)
 }
 
+/// True if `elem` sits inside an EPUB3 structural-semantics section marked
+/// as colophon/copyright/title-page frontmatter or backmatter via the
+/// standard `epub:type` attribute (Standard Ebooks and other EPUB3-aware
+/// tooling tag these consistently — confirmed directly in real EPUBs during
+/// this investigation). This content is often short-line-wrapped for layout
+/// ("Moby Dick␊was published in 1851 by␊Herman Melville.") in a way that's
+/// indistinguishable from verse by length alone, but it's definitely not
+/// narrative verse — an authoritative markup signal beats guessing here.
+/// Deliberately narrow (not "frontmatter"/"backmatter" generally, which can
+/// legitimately contain quoted verse in a preface or dedication) — scoped to
+/// exactly the sections confirmed to cause false positives.
+fn is_in_non_narrative_backmatter(elem: ElementRef) -> bool {
+    const MARKERS: [&str; 5] = ["colophon", "copyright-page", "titlepage", "halftitlepage", "imprint"];
+    for ancestor in elem.ancestors() {
+        let Some(el) = ElementRef::wrap(ancestor) else { continue };
+        if let Some(epub_type) = el.value().attr("epub:type") {
+            if epub_type.split_whitespace().any(|t| MARKERS.contains(&t)) {
+                return true;
+            }
+        }
+        if el.value().name().eq_ignore_ascii_case("body") {
+            break;
+        }
+    }
+    false
+}
+
 /// True if `text` opens with a quotation mark — i.e. this paragraph is
 /// dialogue, not a candidate verse line. Checks straight and the common
 /// curly/typographic quote characters (single and double) in either
@@ -684,6 +725,38 @@ fn leading_number_len(text: &str) -> Option<usize> {
 fn trailing_number_len(text: &str) -> Option<usize> {
     let digit_count = text.chars().rev().take_while(|c| c.is_ascii_digit()).count();
     (1..=4).contains(&digit_count).then_some(digit_count)
+}
+
+/// Same as `leading_number_len`, but also recognizes the number wrapped in
+/// brackets (e.g. Ringler's Beowulf gutter-marks every 10th line as
+/// "[120] ..." instead of a bare "120 ..."). Kept separate from
+/// `leading_number_len` rather than folded into it: that function doubles as
+/// a *stanza-boundary* signal in `detect_verse_paragraphs`, where a bracketed
+/// running line-count marker would be a false positive for "new stanza" in a
+/// continuously-flowing narrative poem — only used here, for carving the
+/// marker into its own display span.
+fn leading_number_or_bracketed_len(text: &str) -> Option<usize> {
+    if let Some(rest) = text.strip_prefix('[') {
+        let digit_count = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+        if (1..=4).contains(&digit_count) && rest.chars().nth(digit_count) == Some(']') {
+            return Some(digit_count + 2);
+        }
+        return None;
+    }
+    leading_number_len(text)
+}
+
+/// Bracket-aware counterpart to `trailing_number_len` — see
+/// `leading_number_or_bracketed_len`.
+fn trailing_number_or_bracketed_len(text: &str) -> Option<usize> {
+    if let Some(rest) = text.strip_suffix(']') {
+        let digit_count = rest.chars().rev().take_while(|c| c.is_ascii_digit()).count();
+        if (1..=4).contains(&digit_count) && rest.chars().rev().nth(digit_count) == Some('[') {
+            return Some(digit_count + 2);
+        }
+        return None;
+    }
+    trailing_number_len(text)
 }
 
 /// True if `elem` sits inside some other list's `<li>` — i.e. it's a sublist,
@@ -1021,7 +1094,7 @@ pub fn parse_chapter_html(
             // them distinctly from the verse text, rather than either
             // looking like a stray digit stuck to the first/last word.
             if is_verse {
-                if let Some(len) = leading_number_len(&text) {
+                if let Some(len) = leading_number_or_bracketed_len(&text) {
                     spans.push(Span {
                         start: 0,
                         end: len,
@@ -1030,7 +1103,7 @@ pub fn parse_chapter_html(
                     });
                 }
                 let total_len = text.chars().count();
-                if let Some(len) = trailing_number_len(&text) {
+                if let Some(len) = trailing_number_or_bracketed_len(&text) {
                     // Guard a line that's entirely a short number (matching
                     // both checks) from double-counting the same digits as
                     // two overlapping spans.

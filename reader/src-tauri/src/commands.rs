@@ -262,6 +262,8 @@ struct Settings {
     reading_leading: Option<f64>,
     #[serde(default)]
     reading_verse_spacing: Option<f64>,
+    #[serde(default)]
+    reading_show_verse_numbers: Option<bool>,
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -315,6 +317,7 @@ const DEFAULT_READING_FONT: &str = "literata";
 const DEFAULT_READING_SIZE_PX: f64 = 17.0;
 const DEFAULT_READING_LEADING: f64 = 1.75;
 const DEFAULT_READING_VERSE_SPACING: f64 = 2.0;
+const DEFAULT_SHOW_VERSE_NUMBERS: bool = true;
 
 #[derive(serde::Serialize)]
 pub struct ReadingSettings {
@@ -322,6 +325,7 @@ pub struct ReadingSettings {
     pub size_px: f64,
     pub leading: f64,
     pub verse_spacing: f64,
+    pub show_verse_numbers: bool,
 }
 
 #[tauri::command]
@@ -332,6 +336,7 @@ pub fn get_reading_settings(app: AppHandle) -> Result<ReadingSettings, String> {
         size_px: s.reading_size_px.unwrap_or(DEFAULT_READING_SIZE_PX),
         leading: s.reading_leading.unwrap_or(DEFAULT_READING_LEADING),
         verse_spacing: s.reading_verse_spacing.unwrap_or(DEFAULT_READING_VERSE_SPACING),
+        show_verse_numbers: s.reading_show_verse_numbers.unwrap_or(DEFAULT_SHOW_VERSE_NUMBERS),
     })
 }
 
@@ -341,6 +346,7 @@ pub fn set_reading_settings(
     size_px: f64,
     leading: f64,
     verse_spacing: f64,
+    show_verse_numbers: bool,
     app: AppHandle,
 ) -> Result<(), String> {
     let mut settings = read_settings(&app);
@@ -348,6 +354,7 @@ pub fn set_reading_settings(
     settings.reading_size_px = Some(size_px);
     settings.reading_leading = Some(leading);
     settings.reading_verse_spacing = Some(verse_spacing);
+    settings.reading_show_verse_numbers = Some(show_verse_numbers);
     write_settings(&app, &settings)
 }
 

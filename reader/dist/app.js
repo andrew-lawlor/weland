@@ -1244,7 +1244,7 @@ const READING_LEADING_MAX = 2.2;
 const READING_VERSE_SPACING_MIN = 0.5;
 const READING_VERSE_SPACING_MAX = 6;
 
-let readingSettings = { font: 'literata', size_px: 17, leading: 1.75, verse_spacing: 2 };
+let readingSettings = { font: 'literata', size_px: 17, leading: 1.75, verse_spacing: 2, show_verse_numbers: true };
 
 function fontStackFor(fontId) {
   return (READING_FONTS.find((f) => f.id === fontId) || READING_FONTS[0]).stack;
@@ -1263,6 +1263,12 @@ function applyReadingSettings() {
   document.querySelectorAll('.ts-font-option').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.font === readingSettings.font);
   });
+
+  pane.classList.toggle('hide-verse-numbers', !readingSettings.show_verse_numbers);
+  const verseNumbersToggle = document.getElementById('tsVerseNumbersToggle');
+  verseNumbersToggle.textContent = readingSettings.show_verse_numbers ? 'On' : 'Off';
+  verseNumbersToggle.classList.toggle('active', readingSettings.show_verse_numbers);
+  verseNumbersToggle.setAttribute('aria-checked', String(readingSettings.show_verse_numbers));
 }
 
 async function saveReadingSettings() {
@@ -1272,6 +1278,7 @@ async function saveReadingSettings() {
       sizePx: readingSettings.size_px,
       leading: readingSettings.leading,
       verseSpacing: readingSettings.verse_spacing,
+      showVerseNumbers: readingSettings.show_verse_numbers,
     });
   } catch (err) {
     console.error('Failed to save reading settings', err);
@@ -1327,6 +1334,12 @@ document.getElementById('tsVerseSpacingUp').addEventListener('click', () => {
     READING_VERSE_SPACING_MAX,
     Math.round((readingSettings.verse_spacing + 0.25) * 100) / 100,
   );
+  applyReadingSettings();
+  saveReadingSettings();
+});
+
+document.getElementById('tsVerseNumbersToggle').addEventListener('click', () => {
+  readingSettings.show_verse_numbers = !readingSettings.show_verse_numbers;
   applyReadingSettings();
   saveReadingSettings();
 });

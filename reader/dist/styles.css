@@ -712,6 +712,23 @@ button {
   line-height: 1;
 }
 .ts-stepper button:hover { background: var(--hairline); }
+.ts-toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+.ts-toggle {
+  all: unset;
+  cursor: pointer;
+  padding: 0.32rem 0.7rem;
+  border-radius: 999px;
+  border: 1px solid var(--hairline);
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+.ts-toggle:hover { background: var(--hairline); }
+.ts-toggle.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
 .tb-library {
   all: unset;
   cursor: pointer;
@@ -863,6 +880,10 @@ blockquote.node-text {
   font-size: 0.72em;
   font-variant-numeric: tabular-nums;
   margin-left: 0.5em;
+}
+.reading-pane.hide-verse-numbers .stanza-num,
+.reading-pane.hide-verse-numbers .line-num {
+  display: none;
 }
 .node-list {
   padding-left: 1.3rem;
