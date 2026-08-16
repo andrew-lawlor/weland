@@ -2,6 +2,7 @@
 
 mod commands;
 mod dictionary;
+mod recording;
 
 use rusqlite::Connection;
 use std::sync::Mutex;
@@ -10,6 +11,7 @@ use tauri::{Manager, State};
 pub struct AppState {
     pub db: Mutex<Option<Connection>>,
     pub dict_db: Mutex<Option<Connection>>,
+    pub recording: Mutex<Option<recording::RecordingSession>>,
 }
 
 fn asset_response(mime: String, data: Vec<u8>) -> tauri::http::Response<Vec<u8>> {
@@ -33,7 +35,7 @@ fn not_found() -> tauri::http::Response<Vec<u8>> {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(AppState { db: Mutex::new(None), dict_db: Mutex::new(None) })
+        .manage(AppState { db: Mutex::new(None), dict_db: Mutex::new(None), recording: Mutex::new(None) })
         .register_uri_scheme_protocol("weland-cover", |_ctx, request| {
             // weland-cover://cover/<percent-encoded absolute .wld path> — unlike
             // weland-asset (scoped to whatever book is currently open), library
@@ -93,8 +95,11 @@ fn main() {
             commands::create_highlight,
             commands::create_text_note,
             commands::save_voice_note,
+            recording::start_voice_recording,
+            recording::stop_voice_recording,
             commands::update_note,
             commands::delete_annotation,
+            commands::get_asset_data,
             commands::get_author_name,
             commands::set_author_name,
             commands::list_library,

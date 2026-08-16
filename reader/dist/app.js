@@ -256,6 +256,10 @@ const KIND_ICONS = {
 const KIND_LABELS = { highlight: 'Highlight', text_note: 'Note', voice_note: 'Voice note' };
 
 function renderAnnotationMarks(nodeWrapperEl, nodeId) {
+  // Release any blob: URLs from a previous render of this node's voice
+  // notes before their <audio> elements are discarded, so repeated
+  // renders (every book open, every new annotation) don't leak memory.
+  nodeWrapperEl.querySelectorAll('.popover audio[data-blob-url]').forEach((el) => URL.revokeObjectURL(el.src));
   nodeWrapperEl.querySelectorAll('.gmark, .popover').forEach((el) => el.remove());
   const anns = annotationsByNode.get(nodeId) || [];
 
@@ -282,8 +286,18 @@ function renderAnnotationMarks(nodeWrapperEl, nodeId) {
     if (ann.annotation_type === 'voice_note' && ann.asset_id) {
       const audio = document.createElement('audio');
       audio.controls = true;
-      audio.src = assetUrl(ann.asset_id);
       pop.appendChild(audio);
+      // WebKitGTK's <audio>/<video> pipeline doesn't play media served from
+      // a custom URI scheme like weland-asset:// (unlike <img>, which loads
+      // fine through it) — fetch the bytes over invoke instead and hand the
+      // element a blob: URL, which every webview supports natively.
+      invoke('get_asset_data', { assetId: ann.asset_id })
+        .then(({ mime_type, data_base64 }) => {
+          const bytes = Uint8Array.from(atob(data_base64), (c) => c.charCodeAt(0));
+          audio.dataset.blobUrl = '1';
+          audio.src = URL.createObjectURL(new Blob([bytes], { type: mime_type }));
+        })
+        .catch((err) => console.error('Failed to load voice note audio', err));
     } else if (ann.comment) {
       const p = document.createElement('div');
       p.textContent = ann.comment;
@@ -1649,23 +1663,24 @@ document.getElementById('noteSave').addEventListener('click', async () => {
 
 /* ================= Voice notes ================= */
 
-let mediaRecorder = null;
-let recordedChunks = [];
 let recordingPending = null;
 let recordingStartedAt = 0;
 let recordingTimer = null;
+let recordingActive = false;
 
+// Recording happens natively in Rust (see start_voice_recording /
+// stop_voice_recording in src-tauri/src/recording.rs) instead of via
+// getUserMedia/MediaRecorder — WebKitGTK's own recording path is broken two
+// separate ways, confirmed by hand: its MediaStream-to-WebAudio bridging
+// silently delivers all-zero samples, and its MediaRecorder hardcodes Opus
+// into 2.5ms CELT-only frames (bad at speech, unfixable via any JS option,
+// and the source of the "robotic" sound). cpal opens the mic directly,
+// sidestepping both.
 async function startRecording(sel) {
   recordingPending = sel;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    recordedChunks = [];
-    mediaRecorder = new MediaRecorder(stream);
-    mediaRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) recordedChunks.push(e.data);
-    };
-    mediaRecorder.onstop = onRecordingStop;
-    mediaRecorder.start();
+    await invoke('start_voice_recording');
+    recordingActive = true;
 
     recordingStartedAt = Date.now();
     document.getElementById('recTime').textContent = '0:00';
@@ -1681,21 +1696,30 @@ async function startRecording(sel) {
 }
 
 document.getElementById('stopRecordingBtn').addEventListener('click', () => {
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+  if (recordingActive) stopRecording();
 });
 
-async function onRecordingStop() {
+async function stopRecording() {
+  recordingActive = false;
   clearInterval(recordingTimer);
   document.getElementById('voicePill').hidden = true;
-  mediaRecorder.stream.getTracks().forEach((t) => t.stop());
 
   if (!recordingPending) return;
   const sel = recordingPending;
   recordingPending = null;
 
-  const mimeType = mediaRecorder.mimeType || 'audio/webm';
-  const blob = new Blob(recordedChunks, { type: mimeType });
-  const audioBase64 = await blobToBase64(blob);
+  let mime_type;
+  let data_base64;
+  try {
+    ({ mime_type, data_base64 } = await invoke('stop_voice_recording'));
+  } catch (err) {
+    console.error('Recording produced no audio data', err);
+    showConfirm('The recording came out empty — nothing was captured. Please try again.', {
+      title: 'Recording failed',
+      alertOnly: true,
+    });
+    return;
+  }
 
   try {
     const ann = await invoke('save_voice_note', {
@@ -1703,26 +1727,14 @@ async function onRecordingStop() {
       startOffset: sel.start,
       endOffset: sel.end,
       selectedText: sel.text,
-      audioBase64,
-      mimeType,
+      audioBase64: data_base64,
+      mimeType: mime_type,
       authorName: currentAuthorName,
     });
     addAnnotation(ann);
   } catch (err) {
     console.error('Failed to save voice note', err);
   }
-}
-
-function blobToBase64(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      const dataUrl = reader.result;
-      resolve(dataUrl.substring(dataUrl.indexOf(',') + 1));
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
 }
 
 /* ================= Misc ================= */

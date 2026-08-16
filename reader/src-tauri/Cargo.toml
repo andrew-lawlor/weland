@@ -19,3 +19,14 @@ base64 = "0.22"
 percent-encoding = "2.3"
 whoami = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# Native microphone capture for voice notes (see src/recording.rs) — bypasses
+# WebKitGTK's own getUserMedia/MediaRecorder path, which is broken two
+# separate ways (silent Web Audio bridging, forced low-quality Opus frames).
+cpal = "0.15"
+# Encodes voice notes as Ogg Opus (small, FOSS, well-supported). Its
+# audiopus/audiopus_sys dependency chain can vendor-build libopus from
+# source, but that needs autotools (autoconf/automake) at build time; linking
+# the system libopus via pkg-config instead (requires libopus-dev) is simpler
+# and not an extra runtime cost — GStreamer already pulls in libopus for
+# WebKitGTK's own <audio> Opus playback, so it's present either way.
+ogg-opus = "0.1"

@@ -242,6 +242,26 @@ pub fn delete_annotation(id: i64, state: State<AppState>) -> Result<(), String> 
 }
 
 #[derive(serde::Serialize)]
+pub struct AssetData {
+    pub mime_type: String,
+    pub data_base64: String,
+}
+
+// Voice-note playback goes through invoke + a blob: URL instead of the
+// weland-asset:// protocol used for images — WebKitGTK's <img> loader and
+// its <audio>/<video> media pipeline are separate code paths, and the
+// latter doesn't play audio served from a custom URI scheme (confirmed:
+// the exact same bytes decode cleanly through GStreamer directly, so the
+// data itself was never the problem, only how <audio src> was fetching it).
+#[tauri::command]
+pub fn get_asset_data(asset_id: i64, state: State<AppState>) -> Result<AssetData, String> {
+    let guard = state.db.lock().map_err(|e| e.to_string())?;
+    let conn = locked_conn(&guard)?;
+    let (mime_type, data) = db::load_asset(conn, asset_id).map_err(|e| e.to_string())?;
+    Ok(AssetData { mime_type, data_base64: STANDARD.encode(data) })
+}
+
+#[derive(serde::Serialize)]
 pub struct AuthorInfo {
     pub name: String,
     pub is_saved: bool,
