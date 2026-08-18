@@ -427,6 +427,41 @@ button {
   padding: 0.05em 0.35em;
 }
 
+.library-content-results {
+  margin: 1.4rem 0 0;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--hairline);
+  max-height: 38dvh;
+  overflow-y: auto;
+  flex: none;
+}
+.library-content-results h2 {
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin: 0 0 0.7rem;
+}
+#libraryContentResultsList { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.9rem; }
+.lcr-group { display: flex; flex-direction: column; gap: 0.2rem; }
+.lcr-book { display: flex; align-items: baseline; gap: 0.5rem; }
+.lcr-book-title { font-size: 0.85rem; font-weight: 600; color: var(--ink); }
+.lcr-book-author { font-size: 0.76rem; color: var(--muted); }
+.lcr-snippets { list-style: none; margin: 0; padding: 0; }
+.lcr-snippets button {
+  all: unset;
+  cursor: pointer;
+  display: block;
+  width: 100%;
+  padding: 0.4rem 0.6rem;
+  border-radius: 8px;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--ink);
+}
+.lcr-snippets button:hover { background: var(--hairline); }
+
 .library-grid {
   list-style: none;
   margin: 1.4rem 0 0;

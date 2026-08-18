@@ -517,6 +517,58 @@ pub async fn list_library(app: AppHandle) -> Result<Vec<LibraryBook>, String> {
     .map_err(|e| e.to_string())?
 }
 
+#[derive(serde::Serialize)]
+pub struct LibrarySearchHit {
+    pub path: String,
+    pub title: String,
+    pub author: Option<String>,
+    pub node_id: i64,
+    pub snippet: String,
+}
+
+const LIBRARY_SEARCH_PER_BOOK_LIMIT: usize = 4;
+const LIBRARY_SEARCH_OVERALL_LIMIT: usize = 60;
+
+// Searches every book's own FTS5 index in turn rather than maintaining a
+// combined cross-book index — .wld files are independent SQLite databases
+// by design (portable, one file per book), and re-scanning ~150 books'
+// worth of small FTS5 queries is fast enough not to need one. A per-book
+// cap keeps one prolific match from crowding out every other book; the
+// overall cap bounds total render cost. One book's query failing (missing
+// file, corrupt FTS index) just gets skipped, not propagated — matches
+// export_library/import_folder's "one failure doesn't abort the batch".
+#[tauri::command]
+pub async fn search_library(query: String, app: AppHandle) -> Result<Vec<LibrarySearchHit>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut entries = read_library(&app)?;
+        entries.sort_by(|a, b| b.last_opened_at.cmp(&a.last_opened_at));
+
+        let mut hits = Vec::new();
+        for entry in entries.iter().filter(|e| Path::new(&e.path).exists()) {
+            if hits.len() >= LIBRARY_SEARCH_OVERALL_LIMIT {
+                break;
+            }
+            let Ok(conn) = Connection::open_with_flags(&entry.path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+                continue;
+            };
+            let Ok(book_hits) = db::search_nodes(&conn, &query, LIBRARY_SEARCH_PER_BOOK_LIMIT) else {
+                continue;
+            };
+            hits.extend(book_hits.into_iter().map(|h| LibrarySearchHit {
+                path: entry.path.clone(),
+                title: entry.title.clone(),
+                author: entry.author.clone(),
+                node_id: h.node_id,
+                snippet: h.snippet,
+            }));
+        }
+        hits.truncate(LIBRARY_SEARCH_OVERALL_LIMIT);
+        Ok(hits)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 pub fn remove_from_library(path: String, app: AppHandle) -> Result<(), String> {
     let mut entries = read_library(&app)?;

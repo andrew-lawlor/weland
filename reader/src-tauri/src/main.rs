@@ -103,6 +103,7 @@ fn main() {
             commands::get_author_name,
             commands::set_author_name,
             commands::list_library,
+            commands::search_library,
             commands::remove_from_library,
             commands::export_book,
             commands::export_library,

@@ -585,6 +585,7 @@ function renderBook(book) {
   // replaces the old one. Without this, closing a book mid-scroll and
   // opening a new one can leave it opening already scrolled partway down.
   scrollAnimId++;
+  const myScrollGen = scrollAnimId;
   heldScrollDirection = 0;
 
   currentBook = book;
@@ -644,10 +645,14 @@ function renderBook(book) {
   // Safety net: if leftover kinetic momentum from the previous book is
   // still landing a frame or two later (the overflow toggle above should
   // normally prevent this), reassert the correct position once more after
-  // things have settled. Bails if another book was opened in the meantime.
+  // things have settled. Bails if another book was opened in the meantime,
+  // or if something already deliberately jumped elsewhere since render —
+  // e.g. a cross-library search hit that opens this book and immediately
+  // scrolls to the matched node, which smoothScrollTo bumps scrollAnimId
+  // for — since re-asserting the saved position would yank that back.
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
-      if (currentBook !== book) return;
+      if (currentBook !== book || scrollAnimId !== myScrollGen) return;
       if (book.last_position_node_id == null) {
         pane.scrollTop = 0;
       } else {
@@ -1055,11 +1060,108 @@ async function loadLibrary() {
 // image) from scratch, so re-running it on every keystroke while typing
 // fast is what made search feel like it was momentarily locking up.
 let librarySearchTimeout = null;
+// Separate, slightly longer debounce for the cross-book content search —
+// it's a real query against every book's own FTS5 index (search_library in
+// commands.rs), not a free in-memory filter like the title/author match
+// above, so it shouldn't fire on every keystroke.
+let libraryContentSearchTimeout = null;
 document.getElementById('librarySearch').addEventListener('input', (e) => {
   clearTimeout(librarySearchTimeout);
   const value = e.target.value.trim();
   librarySearchTimeout = setTimeout(() => renderLibrary(value), 120);
+
+  clearTimeout(libraryContentSearchTimeout);
+  if (value.length < 2) {
+    document.getElementById('libraryContentResults').hidden = true;
+    return;
+  }
+  libraryContentSearchTimeout = setTimeout(() => runLibraryContentSearch(value), 300);
 });
+
+async function runLibraryContentSearch(query) {
+  let hits;
+  try {
+    hits = await invoke('search_library', { query });
+  } catch (err) {
+    console.error('Library content search failed', err);
+    return;
+  }
+  // The box may have been cleared/changed again while this was in flight.
+  if (document.getElementById('librarySearch').value.trim() !== query) return;
+  renderLibraryContentResults(query, hits);
+}
+
+function renderLibraryContentResults(query, hits) {
+  const panel = document.getElementById('libraryContentResults');
+  const list = document.getElementById('libraryContentResultsList');
+  list.innerHTML = '';
+
+  if (hits.length === 0) {
+    panel.hidden = true;
+    return;
+  }
+
+  document.getElementById('libraryContentResultsTitle').textContent = `Matches in your books for "${query}"`;
+
+  // Group by book, preserving the backend's per-book ranked order and its
+  // most-recently-read-first book order.
+  const groups = new Map();
+  for (const hit of hits) {
+    if (!groups.has(hit.path)) groups.set(hit.path, { title: hit.title, author: hit.author, hits: [] });
+    groups.get(hit.path).hits.push(hit);
+  }
+
+  for (const [path, group] of groups) {
+    const li = document.createElement('li');
+    li.className = 'lcr-group';
+
+    const header = document.createElement('div');
+    header.className = 'lcr-book';
+    header.innerHTML = `<span class="lcr-book-title">${escapeHtml(group.title)}</span>${
+      group.author ? `<span class="lcr-book-author">by ${escapeHtml(group.author)}</span>` : ''
+    }`;
+    li.appendChild(header);
+
+    const snippets = document.createElement('ol');
+    snippets.className = 'lcr-snippets';
+    for (const hit of group.hits) {
+      const snipLi = document.createElement('li');
+      const btn = document.createElement('button');
+      btn.innerHTML = escapeHtml(hit.snippet).split('«').join('<mark>').split('»').join('</mark>');
+      btn.addEventListener('click', () => openLibrarySearchHit(hit));
+      snipLi.appendChild(btn);
+      snippets.appendChild(snipLi);
+    }
+    li.appendChild(snippets);
+    list.appendChild(li);
+  }
+
+  panel.hidden = false;
+}
+
+async function openLibrarySearchHit(hit) {
+  // Matching currentBook.path alone isn't enough — going back to the
+  // library hides #appFrame without clearing currentBook, so a same-book
+  // result clicked after a trip back to the library would otherwise skip
+  // openBookAtPath (and therefore skip re-showing #appFrame) entirely.
+  const wasAlreadyOpen =
+    currentBook && currentBook.path === hit.path && !document.getElementById('appFrame').hidden;
+  if (!wasAlreadyOpen) {
+    await openBookAtPath(hit.path);
+    // A freshly-opened book's text is still on its `font-display: swap`
+    // fallback font at this point — the real webfont swaps in a moment
+    // later and reflows everything below it. Computing the scroll target
+    // right now (before that swap) lands on whatever paragraph used to be
+    // at that pixel offset, not the actual match. Waiting for fonts plus a
+    // settle frame avoids that; an already-open book's fonts are already
+    // settled, so this wait is skipped there.
+    await document.fonts.ready;
+    await nextPaint();
+  }
+  const terms = extractMatchTerms(hit.snippet);
+  jumpToNode(hit.node_id);
+  flashSearchMatch(hit.node_id, terms);
+}
 
 document.getElementById('libraryBtn').addEventListener('click', () => {
   clearTimeout(positionSaveTimeout);
