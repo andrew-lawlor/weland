@@ -16,9 +16,6 @@ directories = "5"
 # near-verbatim from reader/src-tauri/src/recording.rs.
 cpal = "0.15"
 ogg-opus = "0.1"
-# Online dictionary fallback — see src/dictionary.rs. Blocking client, run
-# off the main thread on a plain std::thread (no async runtime in this crate).
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "blocking"] }
 # Embeds the vendored reading fonts (resources/fonts/*.woff2, self-hosted
 # per CLAUDE.md — no runtime network calls) into the binary as one directory
 # tree, rather than 39 individual include_bytes! lines.

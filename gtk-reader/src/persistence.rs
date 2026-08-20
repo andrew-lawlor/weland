@@ -116,6 +116,71 @@ pub fn update_reading_position(config_dir: &Path, path: &str, node_id: i64, perc
     Ok(())
 }
 
+/// One saved word from the vocab-builder feature: a dictionary lookup the
+/// reader chose to keep, with the surrounding sentence(s) captured at
+/// save-time (not re-derived later from the book) so the entry still means
+/// something even if that book is never opened again. App-level JSON, not
+/// per-book SQLite like annotations — the point of a vocab list is
+/// browsing it across everything read, not one book's own data.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct VocabEntry {
+    pub id: i64,
+    pub word: String,
+    pub definition: String,
+    pub context_before: String,
+    pub context_after: String,
+    pub book_title: String,
+    pub added_at: i64,
+}
+
+fn vocab_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("vocab.json")
+}
+
+pub fn read_vocab(config_dir: &Path) -> Result<Vec<VocabEntry>> {
+    match fs::read_to_string(vocab_path(config_dir)) {
+        Ok(data) => Ok(serde_json::from_str(&data).unwrap_or_default()),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+pub fn write_vocab(config_dir: &Path, entries: &[VocabEntry]) -> Result<()> {
+    fs::create_dir_all(config_dir).context("Failed to create config dir")?;
+    let data = serde_json::to_string_pretty(entries).context("Failed to serialize vocab")?;
+    fs::write(vocab_path(config_dir), data).context("Failed to write vocab.json")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn add_vocab_entry(
+    config_dir: &Path,
+    word: &str,
+    definition: &str,
+    context_before: &str,
+    context_after: &str,
+    book_title: &str,
+) -> Result<()> {
+    let mut entries = read_vocab(config_dir)?;
+    // Nanosecond-precision id (not just now_epoch_secs()) since a user could
+    // plausibly add two words within the same second.
+    let id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0);
+    entries.push(VocabEntry {
+        id,
+        word: word.to_string(),
+        definition: definition.to_string(),
+        context_before: context_before.to_string(),
+        context_after: context_after.to_string(),
+        book_title: book_title.to_string(),
+        added_at: now_epoch_secs(),
+    });
+    write_vocab(config_dir, &entries)
+}
+
+pub fn remove_vocab_entry(config_dir: &Path, id: i64) -> Result<()> {
+    let mut entries = read_vocab(config_dir)?;
+    entries.retain(|e| e.id != id);
+    write_vocab(config_dir, &entries)
+}
+
 /// Deterministic per-source sandboxed path: same source EPUB (by canonical
 /// path) always resolves to the same output, so re-importing an
 /// already-compiled book skips recompilation and never clobbers its
@@ -241,5 +306,27 @@ mod tests {
 
         assert_eq!(out_a1, out_a2, "the same source path must hash to the same output every time");
         assert_ne!(out_a1, out_b, "different source paths must not collide");
+    }
+
+    #[test]
+    fn vocab_add_persists_context_and_remove_deletes_only_that_entry() {
+        let dir = tempdir().unwrap();
+        assert!(read_vocab(dir.path()).unwrap().is_empty());
+
+        add_vocab_entry(dir.path(), "lenteous", "part of \"plenteous\"", "the harvest was p", "and his master was kind", "Robin Hood").unwrap();
+        add_vocab_entry(dir.path(), "cat", "a small domesticated feline", "she had a", "sleeping on the sill", "Some Other Book").unwrap();
+
+        let entries = read_vocab(dir.path()).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].word, "lenteous");
+        assert_eq!(entries[0].context_before, "the harvest was p");
+        assert_eq!(entries[0].context_after, "and his master was kind");
+        assert_eq!(entries[0].book_title, "Robin Hood");
+        assert_ne!(entries[0].id, entries[1].id, "each entry must get a distinct id");
+
+        remove_vocab_entry(dir.path(), entries[0].id).unwrap();
+        let remaining = read_vocab(dir.path()).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].word, "cat");
     }
 }

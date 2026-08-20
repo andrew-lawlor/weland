@@ -293,6 +293,10 @@ pub fn build_document(
     }
 }
 
+/// Cap on a decoded image's displayed height — without this, a single
+/// full-page plate would dominate the reading pane.
+const MAX_IMAGE_HEIGHT: i32 = 340;
+
 /// A `GtkTextChildAnchor` widget is allocated exactly its own natural size
 /// within the text flow — `picture.set_halign(Center)` is a no-op there,
 /// since there's no extra space around it to center *into*. Real centering
@@ -300,18 +304,41 @@ pub fn build_document(
 /// margins sized off the current view width, which changes both on window
 /// resize and as each image's real size becomes known after lazy decode —
 /// so this just recomputes on every frame rather than chasing the "right"
-/// one-shot signal for either case. `Picture::width()` reads back as 0
-/// before that image has decoded, so those are skipped until their turn.
+/// one-shot signal for either case.
+///
+/// Also does the sizing itself, not just centering: a `Picture`'s natural
+/// size is its source pixbuf's own resolution (same trap as the library
+/// grid's covers — see `library.rs`'s `decode_cover`), so a wide plate (e.g.
+/// Walden's imprint page) requested at its intrinsic width forced the
+/// `TextView` wider than the pane and produced horizontal scroll. Capping to
+/// `MAX_IMAGE_HEIGHT` alone isn't enough for a wide-but-short image, so this
+/// also clamps to the view's current usable width, whichever is more
+/// restrictive. `paintable()` reads back `None` before that image has
+/// decoded, so those are skipped until their turn.
 pub fn wire_image_centering(text_view: &TextView, pictures: Vec<Picture>) {
     text_view.add_tick_callback(move |tv, _clock| {
         let usable = tv.width() - tv.left_margin() - tv.right_margin();
+        if usable <= 0 {
+            return glib::ControlFlow::Continue;
+        }
         for picture in &pictures {
-            let pic_w = picture.width();
-            if pic_w > 0 && usable > pic_w {
-                let margin = (usable - pic_w) / 2;
-                picture.set_margin_start(margin);
-                picture.set_margin_end(margin);
+            let Some(paintable) = picture.paintable() else { continue };
+            let (iw, ih) = (paintable.intrinsic_width(), paintable.intrinsic_height());
+            if iw <= 0 || ih <= 0 {
+                continue;
             }
+
+            let mut target_h = MAX_IMAGE_HEIGHT.min(ih);
+            let mut target_w = (iw as i64 * target_h as i64 / ih as i64) as i32;
+            if target_w > usable {
+                target_w = usable;
+                target_h = (ih as i64 * target_w as i64 / iw as i64) as i32;
+            }
+            picture.set_size_request(target_w.max(1), target_h.max(1));
+
+            let margin = ((usable - target_w) / 2).max(0);
+            picture.set_margin_start(margin);
+            picture.set_margin_end(margin);
         }
         glib::ControlFlow::Continue
     });

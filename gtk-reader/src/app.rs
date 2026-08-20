@@ -15,7 +15,7 @@ use weland::db;
 
 use crate::{
     annotation_ui, annotation_ui::AnnotationState, annotations::AnnotationIndex, document, document::PendingImage,
-    node_index::NodeIndex, persistence, search_ui, settings_ui, toc,
+    node_index::NodeIndex, persistence, search_ui, settings_ui, toc, vocab_ui,
 };
 
 /// Builds the reader page's root widget for `path` and returns it alongside
@@ -62,7 +62,8 @@ pub fn build_reader_page(path: &str) -> Result<(Paned, String, gtk::Box)> {
 
     let annotation_tags = annotation_ui::build_annotation_tags(&buffer);
     annotation_ui::render_existing(&buffer, &annotation_tags, &nodes, &index, &annotation_index);
-    let annotation_state = AnnotationState::new(conn, annotation_tags, nodes, index.clone(), text_view.clone(), annotation_index);
+    let annotation_state =
+        AnnotationState::new(conn, annotation_tags, nodes, index.clone(), text_view.clone(), annotation_index, title_text.clone());
     annotation_ui::wire_annotation_interactions(&text_view, &buffer, annotation_state.clone());
 
     let scroller = ScrolledWindow::builder().child(&text_view).hscrollbar_policy(gtk::PolicyType::Never).build();
@@ -80,6 +81,7 @@ pub fn build_reader_page(path: &str) -> Result<(Paned, String, gtk::Box)> {
     // connection rather than sharing the read-write one AnnotationState owns.
     let search_conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).with_context(|| format!("failed to open {path}"))?;
     let search_sidebar = search_ui::build_search_panel(search_conn, annotation_state.clone());
+    let vocab_sidebar = vocab_ui::build_vocab_panel(&annotation_state);
 
     let sidebar_stack = gtk::Stack::new();
     // The stack is now nested inside a plain vertical Box (for the toggle
@@ -92,15 +94,17 @@ pub fn build_reader_page(path: &str) -> Result<(Paned, String, gtk::Box)> {
     sidebar_stack.add_named(&toc_sidebar, Some("toc"));
     sidebar_stack.add_named(&annotations_sidebar, Some("annotations"));
     sidebar_stack.add_named(&search_sidebar, Some("search"));
+    sidebar_stack.add_named(&vocab_sidebar, Some("vocab"));
 
     let toc_toggle = gtk::Button::with_label("Contents");
     let annotations_toggle = gtk::Button::with_label("Annotations");
     let search_toggle = gtk::Button::with_label("Search");
+    let vocab_toggle = gtk::Button::with_label("Vocab");
     let settings_toggle = gtk::Button::with_label("Aa");
     toc_toggle.add_css_class("suggested-action");
 
-    // `.linked` (a GNOME HIG / Adwaita convention) draws these four as one
-    // joined segmented control instead of four separate floating buttons.
+    // `.linked` (a GNOME HIG / Adwaita convention) draws these as one
+    // joined segmented control instead of separate floating buttons.
     let toggle_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     toggle_row.add_css_class("linked");
     toggle_row.set_margin_top(8);
@@ -109,11 +113,13 @@ pub fn build_reader_page(path: &str) -> Result<(Paned, String, gtk::Box)> {
     toggle_row.append(&toc_toggle);
     toggle_row.append(&annotations_toggle);
     toggle_row.append(&search_toggle);
+    toggle_row.append(&vocab_toggle);
     toggle_row.append(&settings_toggle);
 
-    wire_sidebar_toggle(&toc_toggle, &sidebar_stack, "toc", &[annotations_toggle.clone(), search_toggle.clone()]);
-    wire_sidebar_toggle(&annotations_toggle, &sidebar_stack, "annotations", &[toc_toggle.clone(), search_toggle.clone()]);
-    wire_sidebar_toggle(&search_toggle, &sidebar_stack, "search", &[toc_toggle.clone(), annotations_toggle.clone()]);
+    wire_sidebar_toggle(&toc_toggle, &sidebar_stack, "toc", &[annotations_toggle.clone(), search_toggle.clone(), vocab_toggle.clone()]);
+    wire_sidebar_toggle(&annotations_toggle, &sidebar_stack, "annotations", &[toc_toggle.clone(), search_toggle.clone(), vocab_toggle.clone()]);
+    wire_sidebar_toggle(&search_toggle, &sidebar_stack, "search", &[toc_toggle.clone(), annotations_toggle.clone(), vocab_toggle.clone()]);
+    wire_sidebar_toggle(&vocab_toggle, &sidebar_stack, "vocab", &[toc_toggle.clone(), annotations_toggle.clone(), search_toggle.clone()]);
     {
         let base_font = base_font.clone();
         let tags = tags.clone();
@@ -216,12 +222,11 @@ fn decode_and_apply(conn: &Connection, asset_id: i64, picture: &gtk::Picture) {
     }
     let Some(pixbuf) = loader.pixbuf() else { return };
 
-    let (pw, ph) = (pixbuf.width(), pixbuf.height());
-    let target_h = 340i32.min(ph.max(1));
-    let target_w = (pw as i64 * target_h as i64 / ph.max(1) as i64) as i32;
-
+    // Sizing (max height, clamped to the view's usable width so a wide
+    // plate can't force horizontal scroll) is handled per-frame by
+    // `document::wire_image_centering` instead of here, since it also has
+    // to react to window resizes after this one-time decode.
     picture.set_pixbuf(Some(&pixbuf));
-    picture.set_size_request(target_w.max(1), target_h.max(1));
 }
 
 /// Wires one sidebar toggle button: clicking it shows `name`'s page in

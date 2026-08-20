@@ -19,6 +19,7 @@ mod recording;
 mod search_ui;
 mod settings_ui;
 mod toc;
+mod vocab_ui;
 
 use anyhow::Result;
 use gtk4::prelude::*;
@@ -222,5 +223,6 @@ mod tests {
         crate::node_index::tests::check_marks_stay_anchored_and_offsets_are_monotonic();
         crate::annotation_ui::tests::check_selection_anchoring_and_annotation_lookup();
         crate::annotation_ui::tests::check_selection_is_single_word();
+        crate::dictionary_ui::tests::check_context_around();
     }
 }

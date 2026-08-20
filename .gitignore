@@ -2,4 +2,6 @@ target/
 *.epub
 *.wld
 en.sqlite3
+/dictionary.sqlite3
+/gtk-reader/resources/dictionary.sqlite3
 /tui-reader/

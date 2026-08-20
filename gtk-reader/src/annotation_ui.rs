@@ -97,9 +97,19 @@ pub struct AnnotationState {
     // annotation (often the one on the line above, since popovers commonly
     // render above their anchor) and pops that one open instead.
     current_popover: RefCell<Option<Popover>>,
+    // The book's title, needed only by the vocab-builder feature
+    // (dictionary_ui.rs's "Add to Vocab" button) to label a saved word with
+    // which book it came from.
+    pub(crate) title: String,
+    // Mirrors `list_container` above, but for `vocab_ui.rs`'s panel — a
+    // separate module, so this field (and `refresh_vocab_list`'s use of it)
+    // needs crate visibility rather than staying private like the
+    // annotations list's own container.
+    pub(crate) vocab_list_container: RefCell<Option<GtkBox>>,
 }
 
 impl AnnotationState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         conn: Connection,
         tags: AnnotationTags,
@@ -107,6 +117,7 @@ impl AnnotationState {
         index: Rc<NodeIndex>,
         text_view: TextView,
         annotations: AnnotationIndex,
+        title: String,
     ) -> Rc<Self> {
         Rc::new(Self {
             conn,
@@ -118,6 +129,8 @@ impl AnnotationState {
             list_container: RefCell::new(None),
             now_playing: RefCell::new(None),
             current_popover: RefCell::new(None),
+            title,
+            vocab_list_container: RefCell::new(None),
         })
     }
 
@@ -310,7 +323,7 @@ fn create_annotation(
 /// own autohide-on-outside-click) — `handle_release` consults this to make
 /// a click's *first* job "dismiss whatever's open," never "also maybe open
 /// a different one."
-fn track_popover(state: &Rc<AnnotationState>, popover: &Popover) {
+pub(crate) fn track_popover(state: &Rc<AnnotationState>, popover: &Popover) {
     *state.current_popover.borrow_mut() = Some(popover.clone());
     let state = state.clone();
     popover.connect_closed(move |_| {
@@ -729,7 +742,7 @@ fn handle_release(text_view: &TextView, buffer: &TextBuffer, x: f64, y: f64, sta
             if selection_is_single_word(&start, &end) {
                 let word = buffer.text(&start, &end, false).to_string();
                 let rect = rect_for_range(text_view, buffer, start.offset(), end.offset());
-                dictionary_ui::show_word_lookup(text_view, rect, &word);
+                dictionary_ui::show_word_lookup(text_view, buffer, rect, &word, start.offset(), end.offset(), state);
                 return;
             }
         }
