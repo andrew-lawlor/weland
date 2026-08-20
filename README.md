@@ -39,6 +39,13 @@ cd reader/src-tauri
 cargo run
 ```
 
+`gtk-reader/` is a native GTK4 rewrite of the reader (in progress) — same `weland` core, no webview. It needs `gst-plugins-good` installed at runtime for voice-note playback (`GtkMediaFile` is GStreamer-backed, and the `autoaudiosink` element it needs to reach real audio output lives in that package, not in `gst-plugins-base`). Most desktop systems already have it as a transitive dependency of a browser or video player; a minimal install may not. On Arch: `sudo pacman -S gst-plugins-good`.
+
+```sh
+cd gtk-reader
+cargo run -- path/to/book.wld   # or with no path to open the library view
+```
+
 ## The spec
 
 A `.wld` file is a plain SQLite database — six tables, no proprietary container, readable by anything that speaks SQL:

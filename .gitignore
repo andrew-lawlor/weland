@@ -1,3 +1,5 @@
-/target
+target/
 *.epub
 *.wld
+en.sqlite3
+/tui-reader/

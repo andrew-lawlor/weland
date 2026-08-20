@@ -1,0 +1,28 @@
+[package]
+name = "gtk-reader"
+version = "0.1.0"
+edition = "2021"
+description = "Spike: native GTK4 frontend for the Weland .wld format"
+
+[dependencies]
+weland = { path = ".." }
+rusqlite = { version = "0.32", features = ["bundled", "bundled-full"] }
+gtk4 = { version = "0.11", package = "gtk4", features = ["v4_10"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+directories = "5"
+# Native microphone capture for voice notes — see src/recording.rs, ported
+# near-verbatim from reader/src-tauri/src/recording.rs.
+cpal = "0.15"
+ogg-opus = "0.1"
+# Online dictionary fallback — see src/dictionary.rs. Blocking client, run
+# off the main thread on a plain std::thread (no async runtime in this crate).
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "blocking"] }
+# Embeds the vendored reading fonts (resources/fonts/*.woff2, self-hosted
+# per CLAUDE.md — no runtime network calls) into the binary as one directory
+# tree, rather than 39 individual include_bytes! lines.
+include_dir = "0.7"
+
+[dev-dependencies]
+tempfile = "3.17"
