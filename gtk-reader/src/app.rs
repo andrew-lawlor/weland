@@ -1,5 +1,7 @@
-//! Window/app setup: opens a `.wld`, builds the reading pane, and wires
-//! reading-position restore/tracking on top of it.
+//! Builds the reader page: opens a `.wld`, builds the reading pane, and
+//! wires reading-position restore/tracking on top of it. Returns a widget
+//! (not a window) for `main.rs` to swap into the shared `ApplicationWindow`'s
+//! `gtk::Stack` (Phase 10 single-window navigation).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -7,7 +9,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use gtk4::{self as gtk, gdk_pixbuf, glib, prelude::*, Application, ApplicationWindow, Paned, ScrolledWindow, TextView};
+use gtk4::{self as gtk, gdk_pixbuf, glib, prelude::*, Paned, ScrolledWindow, TextView};
 use rusqlite::{Connection, OpenFlags};
 use weland::db;
 
@@ -16,7 +18,13 @@ use crate::{
     node_index::NodeIndex, persistence, search_ui, settings_ui, toc,
 };
 
-pub fn build_ui(app: &Application, path: &str) -> Result<()> {
+/// Builds the reader page's root widget for `path` and returns it alongside
+/// the window title it implies, and the sidebar widget itself so `main.rs`
+/// can wire a header-bar collapse toggle to it. Back-to-library navigation
+/// lives in the shared `AdwHeaderBar` (`main.rs`'s `Nav`), not in this page —
+/// a back button is a header-bar-level concept in GNOME/Adwaita apps, not a
+/// peer of the Contents/Annotations/Search tabs.
+pub fn build_reader_page(path: &str) -> Result<(Paned, String, gtk::Box)> {
     // Read-write: annotations get created/edited/deleted interactively.
     // Image decode gets its own separate read-only connection below, since
     // this one is moved into `AnnotationState` for the lifetime of the window.
@@ -91,7 +99,10 @@ pub fn build_ui(app: &Application, path: &str) -> Result<()> {
     let settings_toggle = gtk::Button::with_label("Aa");
     toc_toggle.add_css_class("suggested-action");
 
-    let toggle_row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    // `.linked` (a GNOME HIG / Adwaita convention) draws these four as one
+    // joined segmented control instead of four separate floating buttons.
+    let toggle_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    toggle_row.add_css_class("linked");
     toggle_row.set_margin_top(8);
     toggle_row.set_margin_start(8);
     toggle_row.set_margin_end(8);
@@ -126,14 +137,6 @@ pub fn build_ui(app: &Application, path: &str) -> Result<()> {
         .position(220)
         .build();
 
-    let window = ApplicationWindow::builder()
-        .application(app)
-        .title(&window_title)
-        .default_width(1080)
-        .default_height(1000)
-        .child(&paned)
-        .build();
-
     // Read any saved position *before* upserting the library entry (which
     // only bumps last_opened_at/title/author, never the position fields) —
     // same order as the Tauri app's open_book.
@@ -148,17 +151,16 @@ pub fn build_ui(app: &Application, path: &str) -> Result<()> {
         let _ = persistence::upsert_library_entry(dir, path, &title_text, author_text.as_deref());
     }
 
-    window.present();
-
     if let Some(node_id) = saved_node_id {
         if let Some(mark) = index.mark_for_node(node_id) {
             let text_view = text_view.clone();
             let mark = mark.clone();
-            // A freshly presented window hasn't finished layout on the first
-            // main-loop tick — scrolling immediately lands at the wrong
-            // position (the same trap hit an image-scroll debug affordance
-            // during the rendering spike). A short timeout, not an idle
-            // callback, reliably waits long enough for layout to settle.
+            // The page hasn't been laid out yet at the moment it's swapped
+            // into the stack's visible child — scrolling immediately lands
+            // at the wrong position (the same trap hit an image-scroll
+            // debug affordance during the rendering spike). A short
+            // timeout, not an idle callback, reliably waits long enough for
+            // layout to settle.
             glib::timeout_add_local_once(Duration::from_millis(150), move || {
                 text_view.scroll_to_mark(&mark, 0.0, true, 0.0, 0.0);
             });
@@ -171,11 +173,11 @@ pub fn build_ui(app: &Application, path: &str) -> Result<()> {
     document::wire_image_centering(&text_view, recenter_pictures);
 
     // A second, read-only connection — the read-write one above is already
-    // owned by `AnnotationState` for the window's lifetime.
+    // owned by `AnnotationState` for the page's lifetime.
     let image_conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).with_context(|| format!("failed to open {path}"))?;
     spawn_lazy_image_decode(image_conn, pending_images);
 
-    Ok(())
+    Ok((paned, window_title, sidebar))
 }
 
 /// Decodes each pending image's bytes a small batch at a time on `glib`

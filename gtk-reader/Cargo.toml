@@ -23,6 +23,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # per CLAUDE.md — no runtime network calls) into the binary as one directory
 # tree, rather than 39 individual include_bytes! lines.
 include_dir = "0.7"
+libadwaita = { version = "0.9", features = ["v1_4"] }
 
 [dev-dependencies]
 tempfile = "3.17"

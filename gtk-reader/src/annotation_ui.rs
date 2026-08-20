@@ -89,6 +89,14 @@ pub struct AnnotationState {
     // whatever was here, which also doubles as "only one voice note plays at
     // a time."
     now_playing: RefCell<Option<gtk::MediaFile>>,
+    // The one annotation-related popover currently open (create/view/note-
+    // composer/recording — whichever), if any. A click landing on the text
+    // view while one of these is open should just dismiss it, not *also* be
+    // evaluated as a fresh annotation click — otherwise a click meant to
+    // close the current popover routinely lands on/near a different
+    // annotation (often the one on the line above, since popovers commonly
+    // render above their anchor) and pops that one open instead.
+    current_popover: RefCell<Option<Popover>>,
 }
 
 impl AnnotationState {
@@ -109,6 +117,7 @@ impl AnnotationState {
             annotations: RefCell::new(annotations),
             list_container: RefCell::new(None),
             now_playing: RefCell::new(None),
+            current_popover: RefCell::new(None),
         })
     }
 
@@ -296,6 +305,19 @@ fn create_annotation(
     refresh_annotation_list(state);
 }
 
+/// Remembers `popover` as the one currently open, and forgets it again the
+/// moment GTK reports it closed (whether from an explicit `popdown()` or its
+/// own autohide-on-outside-click) — `handle_release` consults this to make
+/// a click's *first* job "dismiss whatever's open," never "also maybe open
+/// a different one."
+fn track_popover(state: &Rc<AnnotationState>, popover: &Popover) {
+    *state.current_popover.borrow_mut() = Some(popover.clone());
+    let state = state.clone();
+    popover.connect_closed(move |_| {
+        *state.current_popover.borrow_mut() = None;
+    });
+}
+
 /// Swaps `popover`'s child for a text entry + Save button; `on_save` fires
 /// with the trimmed, non-empty comment text. Shared between "new note" and
 /// "edit existing note", which differ only in `initial_text` and what
@@ -309,11 +331,27 @@ fn create_annotation(
 /// reusing a shown popover's surface sidesteps that entirely, and matches
 /// how `show_create_popover`/`show_view_popover` already build their full
 /// content before the one and only `popup()` call.
-fn show_comment_composer(text_view: &TextView, old_popover: &Popover, rect: gdk::Rectangle, initial_text: &str, on_save: impl Fn(String) + 'static) {
+fn show_comment_composer(
+    text_view: &TextView,
+    old_popover: &Popover,
+    rect: gdk::Rectangle,
+    initial_text: &str,
+    state: &Rc<AnnotationState>,
+    on_save: impl Fn(String) + 'static,
+) {
     old_popover.popdown();
 
     let popover = Popover::new();
     popover.set_parent(text_view);
+    // GTK's own autohide-on-outside-click reacts to button *press*, a full
+    // event cycle before our own dismiss logic (which watches release) ever
+    // runs — so with autohide left on, one click could close the popover
+    // via GTK's grab *and then* still get evaluated by our release handler
+    // as "no popover was open," opening a different one on the very same
+    // click. Disabling it makes `handle_release`'s own tracking (see
+    // `AnnotationState::current_popover`) the single source of truth for
+    // when one of these closes.
+    popover.set_autohide(false);
     popover.set_pointing_to(Some(&rect));
 
     let entry = Entry::builder().placeholder_text("Note\u{2026}").text(initial_text).width_chars(24).build();
@@ -334,6 +372,7 @@ fn show_comment_composer(text_view: &TextView, old_popover: &Popover, rect: gdk:
     });
 
     popover.popup();
+    track_popover(state, &popover);
     entry.grab_focus();
 }
 
@@ -341,6 +380,7 @@ fn show_create_popover(text_view: &TextView, buffer: &TextBuffer, anchor: Select
     let rect = rect_for_range(text_view, buffer, anchor.buffer_start, anchor.buffer_end);
     let popover = Popover::new();
     popover.set_parent(text_view);
+    popover.set_autohide(false);
     popover.set_pointing_to(Some(&rect));
 
     let row = GtkBox::new(Orientation::Horizontal, 6);
@@ -371,10 +411,10 @@ fn show_create_popover(text_view: &TextView, buffer: &TextBuffer, anchor: Select
         let anchor = anchor.clone();
         note_btn.connect_clicked(move |_| {
             let buffer = buffer.clone();
-            let state = state.clone();
             let anchor = anchor.clone();
-            show_comment_composer(&text_view, &popover_outer, rect.clone(), "", move |comment| {
-                create_annotation(&buffer, &state, &anchor, "text_note", Some(comment), None);
+            let state_for_save = state.clone();
+            show_comment_composer(&text_view, &popover_outer, rect.clone(), "", &state, move |comment| {
+                create_annotation(&buffer, &state_for_save, &anchor, "text_note", Some(comment), None);
             });
         });
     }
@@ -391,6 +431,7 @@ fn show_create_popover(text_view: &TextView, buffer: &TextBuffer, anchor: Select
     }
 
     popover.popup();
+    track_popover(&state, &popover);
 }
 
 /// Closes `old_popover`, starts microphone capture immediately, and opens a
@@ -418,6 +459,7 @@ fn show_recording_popover(
 
     let popover = Popover::new();
     popover.set_parent(text_view);
+    popover.set_autohide(false);
     popover.set_pointing_to(Some(&rect));
 
     let elapsed_label = Label::new(Some("Recording\u{2026} 0:00"));
@@ -459,12 +501,14 @@ fn show_recording_popover(
     });
 
     popover.popup();
+    track_popover(state, &popover);
 }
 
 fn show_view_popover(text_view: &TextView, buffer: &TextBuffer, ann: UserAnnotation, buffer_start: i32, buffer_end: i32, state: Rc<AnnotationState>) {
     let rect = rect_for_range(text_view, buffer, buffer_start, buffer_end);
     let popover = Popover::new();
     popover.set_parent(text_view);
+    popover.set_autohide(false);
     popover.set_pointing_to(Some(&rect));
 
     let container = GtkBox::new(Orientation::Vertical, 6);
@@ -489,13 +533,13 @@ fn show_view_popover(text_view: &TextView, buffer: &TextBuffer, ann: UserAnnotat
         let ann_id = ann.id;
         let existing_comment = ann.comment.clone().unwrap_or_default();
         edit_btn.connect_clicked(move |_| {
-            let state = state_c.clone();
-            show_comment_composer(&text_view_c, &popover_c, rect_c.clone(), &existing_comment, move |comment| {
-                if db::update_annotation_comment(&state.conn, ann_id, &comment).is_ok() {
-                    if let Ok(fresh) = AnnotationIndex::load(&state.conn) {
-                        *state.annotations.borrow_mut() = fresh;
+            let state_for_save = state_c.clone();
+            show_comment_composer(&text_view_c, &popover_c, rect_c.clone(), &existing_comment, &state_c, move |comment| {
+                if db::update_annotation_comment(&state_for_save.conn, ann_id, &comment).is_ok() {
+                    if let Ok(fresh) = AnnotationIndex::load(&state_for_save.conn) {
+                        *state_for_save.annotations.borrow_mut() = fresh;
                     }
-                    refresh_annotation_list(&state);
+                    refresh_annotation_list(&state_for_save);
                 }
             });
         });
@@ -538,6 +582,7 @@ fn show_view_popover(text_view: &TextView, buffer: &TextBuffer, ann: UserAnnotat
     popover.set_child(Some(&container));
 
     popover.popup();
+    track_popover(&state, &popover);
 }
 
 /// Writes the voice note's Ogg Opus bytes out to a scratch temp file and
@@ -622,12 +667,24 @@ pub fn wire_annotation_interactions(text_view: &TextView, buffer: &TextBuffer, s
         if event.event_type() == gdk::EventType::ButtonRelease {
             if let Some(button_event) = event.downcast_ref::<gdk::ButtonEvent>() {
                 if button_event.button() == gdk::BUTTON_PRIMARY {
+                    // `event.position()` is surface-relative (the whole
+                    // top-level window), not relative to `text_view` — using
+                    // it directly baked the sidebar's width/toolbar height
+                    // into every click as a rightward/downward offset,
+                    // making annotations increasingly unclickable the
+                    // further right they sat on their line. Translate
+                    // through the root widget into text_view's own
+                    // coordinate space first.
                     if let Some((x, y)) = event.position() {
                         let text_view = text_view_for_event.clone();
                         let buffer = buffer_for_event.clone();
                         let state = state.clone();
                         glib::idle_add_local_once(move || {
-                            handle_release(&text_view, &buffer, x, y, &state);
+                            let (tx, ty) = text_view
+                                .root()
+                                .and_then(|root| root.translate_coordinates(&text_view, x, y))
+                                .unwrap_or((x, y));
+                            handle_release(&text_view, &buffer, tx, ty, &state);
                         });
                     }
                 }
@@ -638,6 +695,27 @@ pub fn wire_annotation_interactions(text_view: &TextView, buffer: &TextBuffer, s
 }
 
 fn handle_release(text_view: &TextView, buffer: &TextBuffer, x: f64, y: f64, state: &Rc<AnnotationState>) {
+    // If a popover from a previous click is still open, this click's first
+    // job is dismissing it. A genuine fresh selection (drag) still goes on
+    // to open its own create-popover below, but a bare click, once it's
+    // closed the old popover, is done -- without this, a click meant only
+    // to dismiss the current popover routinely got evaluated as a brand new
+    // annotation click too, and since popovers commonly render above their
+    // anchor, that new click just as routinely landed on whatever
+    // annotation was on the line above, popping a different popover open in
+    // the old one's place.
+    // `.take()` ends the `RefCell` borrow as soon as this statement
+    // finishes, *before* `popdown()` runs — `popdown()` synchronously fires
+    // `closed`, which re-enters `current_popover.borrow_mut()` via
+    // `track_popover`'s handler, so calling it while still inside the
+    // `borrow_mut()` chain above (e.g. `.borrow_mut().take().map(|p|
+    // p.popdown())`) panics with "already mutably borrowed."
+    let previous_popover = state.current_popover.borrow_mut().take();
+    let had_open_popover = previous_popover.is_some();
+    if let Some(popover) = previous_popover {
+        popover.popdown();
+    }
+
     if buffer.has_selection() {
         // A selection spanning exactly one whole word is what GTK's own
         // double-click-to-select-word produces — natively and
@@ -661,15 +739,65 @@ fn handle_release(text_view: &TextView, buffer: &TextBuffer, x: f64, y: f64, sta
         return;
     }
 
+    if had_open_popover {
+        return;
+    }
+
     let (bx, by) = text_view.window_to_buffer_coords(TextWindowType::Widget, x as i32, y as i32);
-    let Some(iter) = text_view.iter_at_location(bx, by) else { return };
     let hit = {
         let anns = state.annotations.borrow();
-        find_annotation_at(buffer, iter.offset(), &state.nodes, &state.index, &anns)
+        find_annotation_near(text_view, buffer, bx, by, &state.nodes, &state.index, &anns)
     };
     if let Some((ann, start, end)) = hit {
         show_view_popover(text_view, buffer, ann, start, end, state.clone());
     }
+}
+
+/// Finds the annotation nearest a click, tolerating real-world imprecision:
+/// tries the exact clicked position first, then — if that misses — any
+/// annotation in the same node whose rendered extent touches the click's
+/// line, picking the nearest by horizontal distance. A short annotation (a
+/// handful of characters, sometimes only part of a word — e.g. a highlight
+/// on just "lenteous" out of "plenteous") is an unreasonably narrow pixel
+/// target otherwise: confirmed via a live debug session where clicks 250+ px
+/// away from an 8-character annotation's actual rendered position were the
+/// norm, not the exception, while still landing on the correct line.
+fn find_annotation_near(
+    text_view: &TextView,
+    buffer: &TextBuffer,
+    bx: i32,
+    by: i32,
+    nodes: &[AstNode],
+    index: &NodeIndex,
+    annotation_index: &AnnotationIndex,
+) -> Option<(UserAnnotation, i32, i32)> {
+    let iter = text_view.iter_at_location(bx, by)?;
+    if let Some(hit) = find_annotation_at(buffer, iter.offset(), nodes, index, annotation_index) {
+        return Some(hit);
+    }
+
+    let boundaries = node_boundaries(buffer, nodes, index);
+    let (node, _, _) = node_at_offset(buffer, nodes, &boundaries, iter.offset())?;
+    let content_start = content_start_offset(buffer, node, index)?;
+    let click_line = iter.line();
+
+    let mut best: Option<(i32, &UserAnnotation, i32, i32)> = None;
+    for ann in annotation_index.for_node(node.id) {
+        let start = content_start + ann.start_offset as i32;
+        let end = content_start + ann.end_offset as i32;
+        let start_iter = buffer.iter_at_offset(start);
+        let end_iter = buffer.iter_at_offset(end.max(start + 1));
+        if start_iter.line() != click_line && end_iter.line() != click_line {
+            continue;
+        }
+        let start_x = text_view.iter_location(&start_iter).x();
+        let end_x = text_view.iter_location(&end_iter).x();
+        let dist = if bx < start_x { start_x - bx } else { (bx - end_x).max(0) };
+        if best.as_ref().map(|(d, ..)| dist < *d).unwrap_or(true) {
+            best = Some((dist, ann, start, end));
+        }
+    }
+    best.map(|(_, ann, start, end)| (ann.clone(), start, end))
 }
 
 /// Builds the "Annotations" sidebar panel: every annotation in the book,
