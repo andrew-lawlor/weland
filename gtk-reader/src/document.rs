@@ -142,7 +142,15 @@ fn active_span_tags<'a>(mid: usize, spans: &[SpanAttr], tags: &'a Tags) -> Vec<&
         .filter_map(|s| match s.ty.as_str() {
             "bold" => Some(&tags.bold),
             "italic" => Some(&tags.italic),
-            "line_number" => Some(&tags.dim),
+            // Both the compiler's leading stanza numbers and trailing line
+            // numbers are "verse numbers" as far as the reading-settings
+            // toggle is concerned — the old Tauri reader hides both through
+            // one `.hide-verse-numbers` CSS rule (`app.js`/`styles.css`).
+            // This port only ever wired up `line_number`; `stanza_number`
+            // (the more common of the two in practice -- e.g. every 5th
+            // line numbered in the margin) fell through to plain body text
+            // and never responded to the toggle at all.
+            "line_number" | "stanza_number" => Some(&tags.dim),
             _ => None,
         })
         .collect()
@@ -342,4 +350,38 @@ pub fn wire_image_centering(text_view: &TextView, pictures: Vec<Picture>) {
         }
         glib::ControlFlow::Continue
     });
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use gtk4::TextBuffer;
+
+    // Not a #[test] itself -- see node_index.rs's identical note on why every
+    // GTK-touching check in this crate runs from one shared #[test] entry
+    // point instead of independently claiming a thread.
+    pub(crate) fn check_stanza_and_line_numbers_both_use_dim_tag() {
+        let buffer = TextBuffer::new(None);
+        let tags = build_tags(&buffer);
+        let spans = vec![
+            SpanAttr { start: 0, end: 2, ty: "stanza_number".to_string() },
+            SpanAttr { start: 2, end: 5, ty: "line_number".to_string() },
+            SpanAttr { start: 5, end: 8, ty: "bold".to_string() },
+        ];
+
+        let stanza_tags = active_span_tags(0, &spans, &tags);
+        assert_eq!(stanza_tags.len(), 1);
+        assert!(
+            std::ptr::eq(stanza_tags[0], &tags.dim),
+            "leading stanza numbers must render with the same tag the verse-numbers setting toggles"
+        );
+
+        let line_tags = active_span_tags(2, &spans, &tags);
+        assert_eq!(line_tags.len(), 1);
+        assert!(std::ptr::eq(line_tags[0], &tags.dim));
+
+        let bold_tags = active_span_tags(5, &spans, &tags);
+        assert_eq!(bold_tags.len(), 1);
+        assert!(!std::ptr::eq(bold_tags[0], &tags.dim));
+    }
 }

@@ -3,6 +3,7 @@
 //! replaced by plain directory parameters so this stays pure, GTK-free, and
 //! directly testable against a temp dir.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -27,6 +28,24 @@ pub struct Settings {
     pub reading_verse_spacing: Option<f64>,
     #[serde(default)]
     pub reading_show_verse_numbers: Option<bool>,
+    // Keyed by `keybindings::Action::id()`, not the enum itself -- a plain
+    // string key survives an old settings.json from before an action
+    // existed (or after one is renamed/removed) without failing to parse,
+    // same "tolerate partial/stale data" reasoning as every other field
+    // here. Only overridden actions appear; anything absent falls back to
+    // `keybindings::Action::default_binding()` at load time.
+    #[serde(default)]
+    pub keybindings: Option<HashMap<String, KeyBinding>>,
+}
+
+/// One saved keyboard shortcut: a GDK keyval plus the "meaningful" modifier
+/// bits (Ctrl/Alt/Shift only). Raw `u32`s, not `gdk::Key`/`gdk::ModifierType`,
+/// so this struct — and this whole module — stays GTK-free like everything
+/// else here; `keybindings.rs` owns converting to/from real GDK types.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct KeyBinding {
+    pub keyval: u32,
+    pub modifiers: u32,
 }
 
 fn settings_path(config_dir: &Path) -> PathBuf {

@@ -12,6 +12,7 @@ mod dictionary;
 mod dictionary_ui;
 mod document;
 mod fonts;
+mod keybindings;
 mod library;
 mod node_index;
 mod persistence;
@@ -70,7 +71,11 @@ impl Nav {
     }
 
     fn open_book(self: &Rc<Self>, path: &str) {
-        match app::build_reader_page(path) {
+        let on_back: Rc<dyn Fn()> = {
+            let nav = self.clone();
+            Rc::new(move || nav.show_library())
+        };
+        match app::build_reader_page(path, on_back) {
             Ok((page, title, sidebar)) => {
                 if let Some(old) = self.stack.child_by_name("reader") {
                     self.stack.remove(&old);
@@ -224,5 +229,6 @@ mod tests {
         crate::annotation_ui::tests::check_selection_anchoring_and_annotation_lookup();
         crate::annotation_ui::tests::check_selection_is_single_word();
         crate::dictionary_ui::tests::check_context_around();
+        crate::document::tests::check_stanza_and_line_numbers_both_use_dim_tag();
     }
 }

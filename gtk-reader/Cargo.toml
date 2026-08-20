@@ -20,7 +20,11 @@ ogg-opus = "0.1"
 # per CLAUDE.md — no runtime network calls) into the binary as one directory
 # tree, rather than 39 individual include_bytes! lines.
 include_dir = "0.7"
-libadwaita = { version = "0.9", features = ["v1_4"] }
+# v1_5 (which cascades down through v1_4, so nothing already used regresses)
+# for AdwPreferencesDialog -- the settings menu's home since it stopped
+# fitting comfortably in a popover. System libadwaita here is 1.9.3, so
+# there's no runtime version risk.
+libadwaita = { version = "0.9", features = ["v1_5"] }
 
 [dev-dependencies]
 tempfile = "3.17"

@@ -22,14 +22,18 @@
 //! toggle the shared `dim` tag's `invisible` property, since verse
 //! line-number spans are the only thing that tag is used for.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 
-use gtk4::{prelude::*, Align, Box as GtkBox, Button, Label, Orientation, Popover, TextTag};
+use gtk4::{gdk, glib, prelude::*, Align, Box as GtkBox, Button, EventControllerKey, Label, Orientation, PropagationPhase, TextTag};
+use libadwaita::{self as adw, prelude::*};
 
 use crate::document::Tags;
 use crate::fonts;
-use crate::persistence::{self, Settings};
+use crate::keybindings::{self, Action};
+use crate::persistence::{self, KeyBinding, Settings};
 
 const BASE_PARAGRAPH_SPACING: f64 = 10.0;
 const BASE_BLOCKQUOTE_SPACING: f64 = 8.0;
@@ -79,45 +83,68 @@ pub fn apply_settings(base_font: &TextTag, tags: &Tags, settings: &Settings) {
     tags.dim.set_invisible(!show_numbers);
 }
 
-/// Builds the settings popover contents: a font grid, three +/- steppers,
-/// and a verse-numbers toggle. Every change writes through
+/// Builds the reading settings as a proper `AdwPreferencesDialog` — it
+/// outgrew a popover once keyboard shortcuts joined font/size/leading/verse
+/// settings, and this is the idiomatic GNOME shape for "a general settings
+/// menu" rather than a bigger popover: grouped `AdwPreferencesGroup`s of
+/// `AdwActionRow`s across two pages (`Reading`, `Shortcuts`), with sidebar
+/// navigation between them for free. Every change still writes through
 /// `persistence::write_settings` (read-modify-write) and immediately
-/// re-applies to `base_font`/`tags` — no explicit "Save" step.
-pub fn build_settings_popover(parent: &impl IsA<gtk4::Widget>, base_font: TextTag, tags: Rc<Tags>) -> Popover {
+/// re-applies to `base_font`/`tags` — no explicit "Save" step. Call
+/// `.present(Some(parent))` on the result to show it.
+pub fn build_settings_dialog(base_font: TextTag, tags: Rc<Tags>) -> adw::PreferencesDialog {
     let config_dir = persistence::config_dir().ok();
     let settings = Rc::new(RefCell::new(config_dir.as_ref().map(|d| persistence::read_settings(d)).unwrap_or_default()));
 
-    let popover = Popover::new();
-    popover.set_parent(parent);
-    let container = GtkBox::new(Orientation::Vertical, 10);
-    container.set_margin_top(10);
-    container.set_margin_bottom(10);
-    container.set_margin_start(10);
-    container.set_margin_end(10);
-    container.set_width_request(260);
+    let dialog = adw::PreferencesDialog::new();
+    dialog.set_title("Reading Settings");
 
-    let font_label = Label::new(Some("Font"));
-    font_label.set_halign(Align::Start);
-    font_label.add_css_class("heading");
-    container.append(&font_label);
+    let reading_page = adw::PreferencesPage::new();
+    reading_page.set_title("Reading");
+    reading_page.set_icon_name(Some("preferences-desktop-font-symbolic"));
 
+    let font_group = adw::PreferencesGroup::new();
+    font_group.set_title("Font");
     let font_grid = GtkBox::new(Orientation::Vertical, 2);
+    // `ToggleButton` + `set_group` instead of plain `Button`s -- radio-style
+    // exclusivity gives the currently-selected font a pressed/active visual
+    // state for free, which plain buttons never showed at all (the gap the
+    // font list had until now).
+    let current_font_id = settings.borrow().reading_font.clone().unwrap_or_else(|| "literata".to_string());
+    let mut first_toggle: Option<gtk4::ToggleButton> = None;
     for font in fonts::READING_FONTS {
-        let btn = Button::with_label(font.label);
+        let btn = gtk4::ToggleButton::builder().label(font.label).build();
+        match &first_toggle {
+            Some(first) => btn.set_group(Some(first)),
+            None => first_toggle = Some(btn.clone()),
+        }
+        if current_font_id == font.id {
+            btn.set_active(true);
+        }
+
         let base_font_c = base_font.clone();
         let tags_c = tags.clone();
         let settings_c = settings.clone();
         let config_dir_c = config_dir.clone();
         let font_id = font.id.to_string();
-        btn.connect_clicked(move |_| {
+        btn.connect_toggled(move |btn| {
+            // `set_group` fires `toggled` on both the button losing the
+            // selection and the one gaining it -- only the latter should
+            // persist/apply anything.
+            if !btn.is_active() {
+                return;
+            }
             settings_c.borrow_mut().reading_font = Some(font_id.clone());
             persist_and_apply(&config_dir_c, &settings_c, &base_font_c, &tags_c);
         });
         font_grid.append(&btn);
     }
-    container.append(&font_grid);
+    font_group.add(&font_grid);
+    reading_page.add(&font_group);
 
-    container.append(&stepper_row(
+    let layout_group = adw::PreferencesGroup::new();
+    layout_group.set_title("Layout");
+    layout_group.add(&stepper_action_row(
         "Size",
         &base_font,
         &tags,
@@ -128,7 +155,7 @@ pub fn build_settings_popover(parent: &impl IsA<gtk4::Widget>, base_font: TextTa
         1.0,
         |v| format!("{v:.0}px"),
     ));
-    container.append(&stepper_row(
+    layout_group.add(&stepper_action_row(
         "Line spacing",
         &base_font,
         &tags,
@@ -139,7 +166,7 @@ pub fn build_settings_popover(parent: &impl IsA<gtk4::Widget>, base_font: TextTa
         0.05,
         |v| format!("{v:.2}"),
     ));
-    container.append(&stepper_row(
+    layout_group.add(&stepper_action_row(
         "Verse spacing",
         &base_font,
         &tags,
@@ -151,50 +178,141 @@ pub fn build_settings_popover(parent: &impl IsA<gtk4::Widget>, base_font: TextTa
         |v| format!("{v:.2}rem"),
     ));
 
-    let verse_numbers_row = GtkBox::new(Orientation::Horizontal, 6);
-    let verse_numbers_label = Label::new(Some("Verse line numbers"));
-    verse_numbers_label.set_halign(Align::Start);
-    verse_numbers_label.set_hexpand(true);
-    let verse_numbers_toggle = Button::with_label(if settings.borrow().reading_show_verse_numbers.unwrap_or(true) { "On" } else { "Off" });
+    let verse_numbers_row = adw::SwitchRow::new();
+    verse_numbers_row.set_title("Verse line numbers");
+    verse_numbers_row.set_active(settings.borrow().reading_show_verse_numbers.unwrap_or(true));
     {
         let base_font_c = base_font.clone();
         let tags_c = tags.clone();
         let settings_c = settings.clone();
         let config_dir_c = config_dir.clone();
-        let toggle_c = verse_numbers_toggle.clone();
-        verse_numbers_toggle.connect_clicked(move |_| {
-            let new_value = !settings_c.borrow().reading_show_verse_numbers.unwrap_or(true);
-            settings_c.borrow_mut().reading_show_verse_numbers = Some(new_value);
-            toggle_c.set_label(if new_value { "On" } else { "Off" });
+        verse_numbers_row.connect_active_notify(move |row| {
+            settings_c.borrow_mut().reading_show_verse_numbers = Some(row.is_active());
             persist_and_apply(&config_dir_c, &settings_c, &base_font_c, &tags_c);
         });
     }
-    verse_numbers_row.append(&verse_numbers_label);
-    verse_numbers_row.append(&verse_numbers_toggle);
-    container.append(&verse_numbers_row);
+    layout_group.add(&verse_numbers_row);
+    reading_page.add(&layout_group);
 
-    popover.set_child(Some(&container));
+    dialog.add(&reading_page);
+    dialog.add(&build_shortcuts_page(&dialog, &config_dir));
+
     apply_settings(&base_font, &tags, &settings.borrow());
-    popover
+    dialog
+}
+
+/// Builds the "Shortcuts" page: one `AdwActionRow` per `keybindings::Action`,
+/// each showing its current key and, when clicked, capturing the next
+/// keypress as its new binding. One `EventControllerKey` (Capture phase, so
+/// it sees the key before the just-clicked button's own Space/Enter-
+/// activates-me handling does), attached to `dialog` itself so it fires
+/// regardless of which row's button was clicked — `remapping` tracks which
+/// action, if any, is currently listening.
+fn build_shortcuts_page(dialog: &adw::PreferencesDialog, config_dir: &Option<PathBuf>) -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Shortcuts");
+    page.set_icon_name(Some("input-keyboard-symbolic"));
+
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Keyboard Shortcuts");
+    group.set_description(Some(
+        "Click a shortcut, then press a key to change it. Steam Deck: map controller buttons to these keys from Steam's own Desktop Configuration overlay.",
+    ));
+
+    let bindings: Rc<RefCell<HashMap<Action, KeyBinding>>> =
+        Rc::new(RefCell::new(config_dir.as_ref().map(|d| keybindings::load(d)).unwrap_or_else(keybindings::defaults)));
+    let buttons: Rc<RefCell<HashMap<Action, Button>>> = Rc::new(RefCell::new(HashMap::new()));
+    let remapping: Rc<Cell<Option<Action>>> = Rc::new(Cell::new(None));
+
+    for action in Action::ALL {
+        let row = adw::ActionRow::new();
+        row.set_title(action.label());
+
+        let current = bindings.borrow()[&action];
+        let key_btn = Button::with_label(&keybindings::display(current));
+        key_btn.set_valign(Align::Center);
+        {
+            let remapping_c = remapping.clone();
+            let btn_c = key_btn.clone();
+            key_btn.connect_clicked(move |_| {
+                remapping_c.set(Some(action));
+                btn_c.set_label("Press a key\u{2026}");
+            });
+        }
+
+        row.add_suffix(&key_btn);
+        row.set_activatable_widget(Some(&key_btn));
+        group.add(&row);
+        buttons.borrow_mut().insert(action, key_btn);
+    }
+    page.add(&group);
+
+    let key_controller = EventControllerKey::new();
+    key_controller.set_propagation_phase(PropagationPhase::Capture);
+    {
+        let remapping_c = remapping.clone();
+        let bindings_c = bindings.clone();
+        let buttons_c = buttons.clone();
+        let config_dir_c = config_dir.clone();
+        key_controller.connect_key_pressed(move |_, keyval, _keycode, state| {
+            let Some(action) = remapping_c.get() else { return glib::Propagation::Proceed };
+
+            if keyval == gdk::Key::Escape {
+                // Cancel the remap instead of binding Escape itself -- Escape
+                // stays reserved as "cancel, leave the current binding
+                // alone," matching common remap-UI convention (and it's
+                // already the default Back-to-library key, so there's no
+                // real loss).
+                remapping_c.set(None);
+                if let Some(btn) = buttons_c.borrow().get(&action) {
+                    btn.set_label(&keybindings::display(bindings_c.borrow()[&action]));
+                }
+                return glib::Propagation::Stop;
+            }
+            if keybindings::is_pure_modifier(keyval) {
+                return glib::Propagation::Stop;
+            }
+
+            let binding = keybindings::binding_for_key(keyval, state);
+            keybindings::apply(&mut bindings_c.borrow_mut(), action, binding);
+            if let Some(dir) = &config_dir_c {
+                keybindings::save(dir, action, binding);
+            }
+            // A remap can steal the key from whichever other action held it
+            // (see `keybindings::apply`'s doc comment) -- refresh every
+            // row's label, not just the one just changed, so that other
+            // action's button reflects its fallback-to-default too.
+            for (a, b) in bindings_c.borrow().iter() {
+                if let Some(btn) = buttons_c.borrow().get(a) {
+                    btn.set_label(&keybindings::display(*b));
+                }
+            }
+            remapping_c.set(None);
+            glib::Propagation::Stop
+        });
+    }
+    dialog.add_controller(key_controller);
+
+    page
 }
 
 #[allow(clippy::too_many_arguments)]
-fn stepper_row(
+fn stepper_action_row(
     label_text: &str,
     base_font: &TextTag,
     tags: &Rc<Tags>,
     settings: &Rc<RefCell<Settings>>,
-    config_dir: &Option<std::path::PathBuf>,
+    config_dir: &Option<PathBuf>,
     get: impl Fn(&Settings) -> f64 + 'static,
     set: impl Fn(&mut Settings, f64) + 'static,
     step: f64,
     format: impl Fn(f64) -> String + 'static,
-) -> GtkBox {
-    let row = GtkBox::new(Orientation::Horizontal, 6);
-    let label = Label::new(Some(label_text));
-    label.set_halign(Align::Start);
-    label.set_hexpand(true);
+) -> adw::ActionRow {
+    let row = adw::ActionRow::new();
+    row.set_title(label_text);
 
+    let suffix = GtkBox::new(Orientation::Horizontal, 6);
+    suffix.set_valign(Align::Center);
     let value_label = Label::new(Some(&format(get(&settings.borrow()))));
     let down_btn = Button::with_label("\u{2212}");
     let up_btn = Button::with_label("+");
@@ -220,10 +338,10 @@ fn stepper_row(
         });
     }
 
-    row.append(&label);
-    row.append(&down_btn);
-    row.append(&value_label);
-    row.append(&up_btn);
+    suffix.append(&down_btn);
+    suffix.append(&value_label);
+    suffix.append(&up_btn);
+    row.add_suffix(&suffix);
     row
 }
 

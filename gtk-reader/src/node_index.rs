@@ -11,24 +11,42 @@
 //! of staying where it was created. Found the hard way in the rendering
 //! spike — see the reading-pane centering/scroll notes in the rewrite plan.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use gtk4::{prelude::*, TextBuffer, TextIter, TextMark, TextView};
 
 pub struct NodeIndex {
     /// (node_id, mark), in the same ordinal order nodes were recorded in —
     /// i.e. non-decreasing buffer position.
     entries: Vec<(i64, TextMark)>,
+    /// Same marks as `entries`, keyed for O(1) `mark_for_node` lookup —
+    /// `entries` alone made that a linear scan, which `annotation_ui.rs`'s
+    /// old `node_boundaries` helper called once per node on every rebuild,
+    /// making it effectively O(n^2). That got rebuilt on every mouse-hover
+    /// tooltip query, which is what made a verse-heavy book like the Poetic
+    /// Edda (thousands of one-line nodes) noticeably laggier than an
+    /// image-heavy one with far fewer nodes overall.
+    by_id: HashMap<i64, TextMark>,
+    /// Cached result of `boundaries()` — safe to cache indefinitely because
+    /// nothing in this app inserts/deletes buffer text after the initial
+    /// `build_document` pass (annotations only apply tags), so every mark's
+    /// offset is fixed for the reader page's whole lifetime.
+    boundaries_cache: RefCell<Option<Rc<Vec<i32>>>>,
 }
 
 impl NodeIndex {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self { entries: Vec::new(), by_id: HashMap::new(), boundaries_cache: RefCell::new(None) }
     }
 
     /// Records `node_id` as starting at `iter`'s current position. Must be
     /// called *before* that node's content is inserted.
     pub fn record(&mut self, buffer: &TextBuffer, iter: &TextIter, node_id: i64) {
         let mark = buffer.create_mark(None, iter, true);
-        self.entries.push((node_id, mark));
+        self.entries.push((node_id, mark.clone()));
+        self.by_id.insert(node_id, mark);
     }
 
     // Only exercised by #[cfg(test)] code today, which a plain `cargo build`
@@ -45,7 +63,21 @@ impl NodeIndex {
     }
 
     pub fn mark_for_node(&self, node_id: i64) -> Option<&TextMark> {
-        self.entries.iter().find(|(id, _)| *id == node_id).map(|(_, mark)| mark)
+        self.by_id.get(&node_id)
+    }
+
+    /// Every recorded node's buffer offset, in the same order nodes were
+    /// recorded — parallel to the book's own `ast_nodes` list. Computed once
+    /// and cached (see `boundaries_cache`'s doc comment for why that's
+    /// sound); callers doing frequent per-event lookups (hover, click) get
+    /// an `Rc` clone instead of re-walking every mark through GTK each time.
+    pub fn boundaries(&self, buffer: &TextBuffer) -> Rc<Vec<i32>> {
+        if let Some(cached) = self.boundaries_cache.borrow().as_ref() {
+            return cached.clone();
+        }
+        let computed = Rc::new(self.entries.iter().map(|(_, mark)| buffer.iter_at_mark(mark).offset()).collect());
+        *self.boundaries_cache.borrow_mut() = Some(Rc::clone(&computed));
+        computed
     }
 
     /// The last recorded node whose mark's buffer offset is at or before the

@@ -163,13 +163,6 @@ pub(crate) fn content_start_offset(buffer: &TextBuffer, node: &AstNode, index: &
     Some(if stanza_start { base + 1 } else { base })
 }
 
-/// Node boundaries in buffer-offset order, parallel to `nodes` — node `i`
-/// spans `[boundaries[i], boundaries[i+1])` (or to the buffer's end for the
-/// last node).
-fn node_boundaries(buffer: &TextBuffer, nodes: &[AstNode], index: &NodeIndex) -> Vec<i32> {
-    nodes.iter().map(|n| index.mark_for_node(n.id).map(|m| buffer.iter_at_mark(m).offset()).unwrap_or(i32::MAX)).collect()
-}
-
 fn node_at_offset<'a>(buffer: &TextBuffer, nodes: &'a [AstNode], boundaries: &[i32], offset: i32) -> Option<(&'a AstNode, i32, i32)> {
     let i = boundaries.partition_point(|&b| b <= offset).checked_sub(1)?;
     let node = &nodes[i];
@@ -218,7 +211,7 @@ fn resolve_selection_anchor(buffer: &TextBuffer, nodes: &[AstNode], index: &Node
         return None;
     }
 
-    let boundaries = node_boundaries(buffer, nodes, index);
+    let boundaries = index.boundaries(buffer);
     let (node, node_start, node_end) = node_at_offset(buffer, nodes, &boundaries, sel_start)?;
     if sel_end > node_end || !ANNOTATABLE_TYPES.contains(&node.node_type.as_str()) {
         return None;
@@ -236,7 +229,7 @@ fn resolve_selection_anchor(buffer: &TextBuffer, nodes: &[AstNode], index: &Node
 /// The existing annotation (if any) covering `offset`, plus its buffer
 /// range for tag removal/positioning.
 fn find_annotation_at(buffer: &TextBuffer, offset: i32, nodes: &[AstNode], index: &NodeIndex, annotation_index: &AnnotationIndex) -> Option<(UserAnnotation, i32, i32)> {
-    let boundaries = node_boundaries(buffer, nodes, index);
+    let boundaries = index.boundaries(buffer);
     let (node, _, _) = node_at_offset(buffer, nodes, &boundaries, offset)?;
     let content_start = content_start_offset(buffer, node, index)?;
     let rel = offset - content_start;
@@ -789,7 +782,7 @@ fn find_annotation_near(
         return Some(hit);
     }
 
-    let boundaries = node_boundaries(buffer, nodes, index);
+    let boundaries = index.boundaries(buffer);
     let (node, _, _) = node_at_offset(buffer, nodes, &boundaries, iter.offset())?;
     let content_start = content_start_offset(buffer, node, index)?;
     let click_line = iter.line();

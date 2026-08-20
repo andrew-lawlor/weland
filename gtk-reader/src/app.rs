@@ -10,12 +10,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use gtk4::{self as gtk, gdk_pixbuf, glib, prelude::*, Paned, ScrolledWindow, TextView};
+use libadwaita::prelude::*;
 use rusqlite::{Connection, OpenFlags};
 use weland::db;
 
 use crate::{
-    annotation_ui, annotation_ui::AnnotationState, annotations::AnnotationIndex, document, document::PendingImage,
-    node_index::NodeIndex, persistence, search_ui, settings_ui, toc, vocab_ui,
+    annotation_ui, annotation_ui::AnnotationState, annotations::AnnotationIndex, document, document::PendingImage, keybindings,
+    keybindings::Action, node_index::NodeIndex, persistence, search_ui, settings_ui, toc, vocab_ui,
 };
 
 /// Builds the reader page's root widget for `path` and returns it alongside
@@ -23,8 +24,9 @@ use crate::{
 /// can wire a header-bar collapse toggle to it. Back-to-library navigation
 /// lives in the shared `AdwHeaderBar` (`main.rs`'s `Nav`), not in this page —
 /// a back button is a header-bar-level concept in GNOME/Adwaita apps, not a
-/// peer of the Contents/Annotations/Search tabs.
-pub fn build_reader_page(path: &str) -> Result<(Paned, String, gtk::Box)> {
+/// peer of the Contents/Annotations/Search tabs — but the `BackToLibrary`
+/// keyboard shortcut still needs to reach it, hence `on_back`.
+pub fn build_reader_page(path: &str, on_back: Rc<dyn Fn()>) -> Result<(Paned, String, gtk::Box)> {
     // Read-write: annotations get created/edited/deleted interactively.
     // Image decode gets its own separate read-only connection below, since
     // this one is moved into `AnnotationState` for the lifetime of the window.
@@ -100,7 +102,11 @@ pub fn build_reader_page(path: &str) -> Result<(Paned, String, gtk::Box)> {
     let annotations_toggle = gtk::Button::with_label("Annotations");
     let search_toggle = gtk::Button::with_label("Search");
     let vocab_toggle = gtk::Button::with_label("Vocab");
-    let settings_toggle = gtk::Button::with_label("Aa");
+    // Icon+label, not a plain text button like its siblings -- "Aa" (a
+    // typography-only convention borrowed from e-reader apps) undersold this
+    // once it grew to cover keyboard shortcuts too, not just font settings.
+    let settings_toggle_content = libadwaita::ButtonContent::builder().icon_name("preferences-system-symbolic").label("Settings").build();
+    let settings_toggle = gtk::Button::builder().child(&settings_toggle_content).build();
     toc_toggle.add_css_class("suggested-action");
 
     // `.linked` (a GNOME HIG / Adwaita convention) draws these as one
@@ -125,8 +131,8 @@ pub fn build_reader_page(path: &str) -> Result<(Paned, String, gtk::Box)> {
         let tags = tags.clone();
         let settings_toggle_c = settings_toggle.clone();
         settings_toggle.connect_clicked(move |_| {
-            let popover = settings_ui::build_settings_popover(&settings_toggle_c, base_font.clone(), tags.clone());
-            popover.popup();
+            let dialog = settings_ui::build_settings_dialog(base_font.clone(), tags.clone());
+            dialog.present(Some(&settings_toggle_c));
         });
     }
 
@@ -183,7 +189,106 @@ pub fn build_reader_page(path: &str) -> Result<(Paned, String, gtk::Box)> {
     let image_conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).with_context(|| format!("failed to open {path}"))?;
     spawn_lazy_image_decode(image_conn, pending_images);
 
+    wire_keyboard_shortcuts(&paned, &scroller, &text_view, &buffer, &index, &toc_entries, &sidebar, on_back);
+
     Ok((paned, window_title, sidebar))
+}
+
+/// Wires the remappable reading-pane shortcuts (`keybindings.rs`) to this
+/// page's own widgets. Attached to `paned` (an ancestor of both the text
+/// view and every sidebar panel) with `Capture` phase so it sees every
+/// keypress before `TextView`'s own built-in arrow/Page-key scrolling can
+/// consume it — the only exception is a keypress while a text-entry widget
+/// (the search box, the annotation note composer — both plain `gtk::Entry`s)
+/// has focus, which is let straight through untouched so typing still works.
+fn wire_keyboard_shortcuts(
+    paned: &Paned,
+    scroller: &ScrolledWindow,
+    text_view: &TextView,
+    buffer: &gtk::TextBuffer,
+    index: &Rc<NodeIndex>,
+    toc_entries: &[weland::schema::TocEntry],
+    sidebar: &gtk::Box,
+    on_back: Rc<dyn Fn()>,
+) {
+    let config_dir = persistence::config_dir().ok();
+    let bindings = config_dir.as_ref().map(|d| keybindings::load(d)).unwrap_or_else(keybindings::defaults);
+
+    // Buffer offsets for every TOC entry that actually jumps somewhere, in
+    // document order — computed once up front rather than per-keypress,
+    // same "buffer positions never move after the initial build" reasoning
+    // as `node_index.rs`'s own `boundaries` cache.
+    let mut chapter_offsets: Vec<i32> = toc_entries
+        .iter()
+        .filter_map(|e| e.target_node_id)
+        .filter_map(|node_id| index.mark_for_node(node_id))
+        .map(|mark| buffer.iter_at_mark(mark).offset())
+        .collect();
+    chapter_offsets.sort_unstable();
+
+    let controller = gtk::EventControllerKey::new();
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+
+    let text_view_c = text_view.clone();
+    let buffer_c = buffer.clone();
+    let scroller_c = scroller.clone();
+    let index_c = index.clone();
+    let sidebar_c = sidebar.clone();
+    controller.connect_key_pressed(move |_, keyval, _keycode, state| {
+        let focused_is_entry = text_view_c.root().and_then(|root| root.focus()).map(|w| w.is::<gtk::Entry>()).unwrap_or(false);
+        if focused_is_entry {
+            return glib::Propagation::Proceed;
+        }
+
+        let Some(action) = keybindings::action_for_key(&bindings, keyval, state) else {
+            return glib::Propagation::Proceed;
+        };
+
+        match action {
+            Action::ScrollDown => scroll_by(&scroller_c, 80.0),
+            Action::ScrollUp => scroll_by(&scroller_c, -80.0),
+            Action::PageDown => page_by(&scroller_c, 1.0),
+            Action::PageUp => page_by(&scroller_c, -1.0),
+            Action::NextChapter => jump_chapter(&text_view_c, &buffer_c, &index_c, &chapter_offsets, 1),
+            Action::PrevChapter => jump_chapter(&text_view_c, &buffer_c, &index_c, &chapter_offsets, -1),
+            Action::ToggleSidebar => sidebar_c.set_visible(!sidebar_c.is_visible()),
+            Action::BackToLibrary => on_back(),
+        }
+        glib::Propagation::Stop
+    });
+    paned.add_controller(controller);
+}
+
+fn scroll_by(scroller: &ScrolledWindow, delta: f64) {
+    let adj = scroller.vadjustment();
+    let max = (adj.upper() - adj.page_size()).max(adj.lower());
+    adj.set_value((adj.value() + delta).clamp(adj.lower(), max));
+}
+
+fn page_by(scroller: &ScrolledWindow, direction: f64) {
+    // 90% of a page, not a full page, so the last line of the previous page
+    // stays on screen as a continuity anchor -- the same reason paginated
+    // e-readers commonly overlap slightly rather than cutting exactly at the
+    // page boundary.
+    let page_size = scroller.vadjustment().page_size();
+    scroll_by(scroller, direction * page_size * 0.9);
+}
+
+fn jump_chapter(text_view: &TextView, buffer: &gtk::TextBuffer, index: &NodeIndex, chapter_offsets: &[i32], direction: i32) {
+    let Some(current_id) = index.topmost_visible_node_id(buffer, text_view) else { return };
+    let Some(mark) = index.mark_for_node(current_id) else { return };
+    let current_offset = buffer.iter_at_mark(mark).offset();
+
+    let target_offset = if direction > 0 {
+        chapter_offsets.iter().copied().find(|o| *o > current_offset)
+    } else {
+        chapter_offsets.iter().rev().copied().find(|o| *o < current_offset)
+    };
+
+    if let Some(offset) = target_offset {
+        let mut iter = buffer.iter_at_offset(offset);
+        text_view.scroll_to_iter(&mut iter, 0.0, true, 0.0, 0.0);
+    }
 }
 
 /// Decodes each pending image's bytes a small batch at a time on `glib`
