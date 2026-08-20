@@ -78,6 +78,13 @@ pub struct LibraryEntry {
     // last_position_node_id.
     #[serde(default)]
     pub last_position_percent: Option<f64>,
+    // Captured from the EPUB's own metadata at import time (see
+    // `library.rs`'s `import_one`) rather than re-opened from the .wld on
+    // every library load -- `None` for anything imported before this field
+    // existed; re-importing (cheap, since a compiled book is never
+    // recompiled) backfills it.
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 fn library_path(config_dir: &Path) -> PathBuf {
@@ -104,12 +111,13 @@ fn now_epoch_secs() -> i64 {
         .unwrap_or(0)
 }
 
-pub fn upsert_library_entry(config_dir: &Path, path: &str, title: &str, author: Option<&str>) -> Result<()> {
+pub fn upsert_library_entry(config_dir: &Path, path: &str, title: &str, author: Option<&str>, language: Option<&str>) -> Result<()> {
     let mut entries = read_library(config_dir)?;
     let now = now_epoch_secs();
     if let Some(existing) = entries.iter_mut().find(|e| e.path == path) {
         existing.title = title.to_string();
         existing.author = author.map(|s| s.to_string());
+        existing.language = language.map(|s| s.to_string());
         existing.last_opened_at = now;
     } else {
         entries.push(LibraryEntry {
@@ -120,6 +128,7 @@ pub fn upsert_library_entry(config_dir: &Path, path: &str, title: &str, author: 
             last_opened_at: now,
             last_position_node_id: None,
             last_position_percent: None,
+            language: language.map(|s| s.to_string()),
         });
     }
     write_library(config_dir, &entries)
@@ -130,6 +139,20 @@ pub fn update_reading_position(config_dir: &Path, path: &str, node_id: i64, perc
     if let Some(existing) = entries.iter_mut().find(|e| e.path == path) {
         existing.last_position_node_id = Some(node_id);
         existing.last_position_percent = Some(percent.clamp(0.0, 1.0));
+        write_library(config_dir, &entries)?;
+    }
+    Ok(())
+}
+
+/// A manual override for one book's `language` — some source EPUBs (public
+/// domain scans especially) declare the wrong language or none at all, and
+/// unlike title/author there's no in-app way to fix a bad value short of
+/// this. `None` clears it back to unset rather than leaving a stale wrong
+/// value behind.
+pub fn set_library_entry_language(config_dir: &Path, path: &str, language: Option<&str>) -> Result<()> {
+    let mut entries = read_library(config_dir)?;
+    if let Some(existing) = entries.iter_mut().find(|e| e.path == path) {
+        existing.language = language.map(|s| s.to_string());
         write_library(config_dir, &entries)?;
     }
     Ok(())
@@ -281,14 +304,14 @@ mod tests {
     fn library_upsert_adds_then_updates_in_place() {
         let dir = tempdir().unwrap();
 
-        upsert_library_entry(dir.path(), "/books/odyssey.wld", "The Odyssey", Some("Homer")).unwrap();
+        upsert_library_entry(dir.path(), "/books/odyssey.wld", "The Odyssey", Some("Homer"), Some("en")).unwrap();
         let entries = read_library(dir.path()).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].title, "The Odyssey");
         assert_eq!(entries[0].last_position_node_id, None);
 
         update_reading_position(dir.path(), "/books/odyssey.wld", 42, 0.5).unwrap();
-        upsert_library_entry(dir.path(), "/books/odyssey.wld", "The Odyssey (2nd ed.)", Some("Homer")).unwrap();
+        upsert_library_entry(dir.path(), "/books/odyssey.wld", "The Odyssey (2nd ed.)", Some("Homer"), Some("en")).unwrap();
 
         let entries = read_library(dir.path()).unwrap();
         assert_eq!(entries.len(), 1, "re-adding the same path must not duplicate the entry");
@@ -302,7 +325,7 @@ mod tests {
     #[test]
     fn update_reading_position_clamps_percent() {
         let dir = tempdir().unwrap();
-        upsert_library_entry(dir.path(), "/books/x.wld", "X", None).unwrap();
+        upsert_library_entry(dir.path(), "/books/x.wld", "X", None, None).unwrap();
         update_reading_position(dir.path(), "/books/x.wld", 1, 1.5).unwrap();
         let entries = read_library(dir.path()).unwrap();
         assert_eq!(entries[0].last_position_percent, Some(1.0));

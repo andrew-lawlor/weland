@@ -12,6 +12,7 @@ mod dictionary;
 mod dictionary_ui;
 mod document;
 mod fonts;
+mod image_viewer;
 mod keybindings;
 mod library;
 mod node_index;

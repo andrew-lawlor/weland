@@ -38,6 +38,7 @@ pub fn build_reader_page(path: &str, on_back: Rc<dyn Fn()>) -> Result<(Paned, St
 
     let title_text = metadata.get("title").cloned().unwrap_or_else(|| "Untitled".into());
     let author_text = metadata.get("author").cloned();
+    let language_text = metadata.get("language").cloned();
     let window_title = format!("{title_text} — {}", author_text.clone().unwrap_or_default());
 
     let text_view = TextView::new();
@@ -160,7 +161,7 @@ pub fn build_reader_page(path: &str, on_back: Rc<dyn Fn()>) -> Result<(Paned, St
         .and_then(|e| e.last_position_node_id);
 
     if let Some(dir) = &config_dir {
-        let _ = persistence::upsert_library_entry(dir, path, &title_text, author_text.as_deref());
+        let _ = persistence::upsert_library_entry(dir, path, &title_text, author_text.as_deref(), language_text.as_deref());
     }
 
     if let Some(node_id) = saved_node_id {

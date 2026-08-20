@@ -195,6 +195,8 @@ fn insert_image(text_view: &TextView, buffer: &TextBuffer, iter: &mut TextIter, 
     text_view.add_child_at_anchor(&picture, &anchor);
     buffer.insert(iter, "\n");
 
+    crate::image_viewer::wire_click_to_open(text_view, &picture);
+
     pending.push(PendingImage { asset_id, picture });
 }
 

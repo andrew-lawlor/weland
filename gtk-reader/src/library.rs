@@ -7,7 +7,7 @@
 //! than building a reader window directly.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -15,8 +15,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use gtk4::{
-    self as gtk, gdk_pixbuf, gio, glib, prelude::*, Align, Box as GtkBox, Button, FileDialog, FileFilter, FlowBox,
-    Label, Orientation, Picture, PolicyType, ProgressBar, ScrolledWindow, SearchEntry, SelectionMode,
+    self as gtk, gdk_pixbuf, gio, glib, prelude::*, Align, Box as GtkBox, Button, DropDown, FileDialog, FileFilter,
+    FlowBox, Label, Orientation, Picture, PolicyType, ProgressBar, ScrolledWindow, SearchEntry, SelectionMode,
+    StringList, StringObject, ToggleButton,
 };
 use libadwaita::ApplicationWindow;
 use rusqlite::{Connection, OpenFlags};
@@ -25,6 +26,10 @@ use crate::{persistence, persistence::LibraryEntry};
 
 const COVER_WIDTH: i32 = 110;
 const COVER_HEIGHT: i32 = 160;
+// A book counts as "finished" once its saved position is at or past this
+// fraction -- rarely exactly 1.0 in practice (trailing matter, rounding),
+// same reasoning e-readers generally use for a "done" threshold.
+const FINISHED_THRESHOLD: f64 = 0.97;
 
 type CoverCache = Rc<RefCell<HashMap<String, gdk_pixbuf::Pixbuf>>>;
 
@@ -32,6 +37,254 @@ type CoverCache = Rc<RefCell<HashMap<String, gdk_pixbuf::Pixbuf>>>;
 struct PendingCover {
     path: String,
     picture: Picture,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadingStatus {
+    Unread,
+    InProgress,
+    Finished,
+}
+
+fn reading_status(entry: &LibraryEntry) -> ReadingStatus {
+    match entry.last_position_percent {
+        None => ReadingStatus::Unread,
+        Some(p) if p >= FINISHED_THRESHOLD => ReadingStatus::Finished,
+        Some(p) if p > 0.0 => ReadingStatus::InProgress,
+        Some(_) => ReadingStatus::Unread,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusFilter {
+    All,
+    Unread,
+    InProgress,
+    Finished,
+}
+
+impl StatusFilter {
+    const ALL: [StatusFilter; 4] = [StatusFilter::All, StatusFilter::Unread, StatusFilter::InProgress, StatusFilter::Finished];
+
+    fn label(self) -> &'static str {
+        match self {
+            StatusFilter::All => "All",
+            StatusFilter::Unread => "Unread",
+            StatusFilter::InProgress => "In Progress",
+            StatusFilter::Finished => "Finished",
+        }
+    }
+
+    fn matches(self, entry: &LibraryEntry) -> bool {
+        match self {
+            StatusFilter::All => true,
+            StatusFilter::Unread => reading_status(entry) == ReadingStatus::Unread,
+            StatusFilter::InProgress => reading_status(entry) == ReadingStatus::InProgress,
+            StatusFilter::Finished => reading_status(entry) == ReadingStatus::Finished,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortMode {
+    RecentlyOpened,
+    RecentlyAdded,
+    TitleAsc,
+    TitleDesc,
+    AuthorAsc,
+    AuthorDesc,
+    Progress,
+}
+
+impl SortMode {
+    const ALL: [SortMode; 7] = [
+        SortMode::RecentlyOpened,
+        SortMode::RecentlyAdded,
+        SortMode::TitleAsc,
+        SortMode::TitleDesc,
+        SortMode::AuthorAsc,
+        SortMode::AuthorDesc,
+        SortMode::Progress,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            SortMode::RecentlyOpened => "Recently Opened",
+            SortMode::RecentlyAdded => "Recently Added",
+            SortMode::TitleAsc => "Title (A\u{2013}Z)",
+            SortMode::TitleDesc => "Title (Z\u{2013}A)",
+            SortMode::AuthorAsc => "Author (A\u{2013}Z)",
+            SortMode::AuthorDesc => "Author (Z\u{2013}A)",
+            SortMode::Progress => "Progress",
+        }
+    }
+}
+
+/// All of the library page's filter/sort state, bundled so most functions
+/// take one `&FilterState` instead of four separate `Rc<RefCell<_>>`
+/// parameters -- this grew from just `query` once status/sort/language
+/// filtering joined it.
+#[derive(Clone)]
+struct FilterState {
+    query: Rc<RefCell<String>>,
+    sort: Rc<RefCell<SortMode>>,
+    status: Rc<RefCell<StatusFilter>>,
+    language: Rc<RefCell<Option<String>>>,
+}
+
+impl FilterState {
+    fn new() -> Self {
+        Self {
+            query: Rc::new(RefCell::new(String::new())),
+            sort: Rc::new(RefCell::new(SortMode::RecentlyOpened)),
+            status: Rc::new(RefCell::new(StatusFilter::All)),
+            language: Rc::new(RefCell::new(None)),
+        }
+    }
+}
+
+/// Reduces an author's full display name to a case-insensitive sort key
+/// based on surname -- the last whitespace-separated word, which covers the
+/// common case ("Steve Sando" -> "sando", "George R. R. Martin" -> "martin")
+/// without attempting anything more sophisticated (suffixes like "Jr.",
+/// multi-word surnames, "Last, First" input) that library sorting this
+/// basic doesn't need to get exactly right.
+fn author_sort_key(author: &str) -> String {
+    author.split_whitespace().last().unwrap_or(author).to_lowercase()
+}
+
+/// Reduces a title to a case-insensitive sort key with a leading English
+/// article dropped -- "The Hobbit" sorts under "hobbit" (with "H"), not
+/// "the" (with every other "The ..." title in the library, which is what
+/// straight string comparison would do), matching the standard library-
+/// catalog convention. Only English articles; a title genuinely starting
+/// with a word like "A" that isn't the article ("A" the letter grade, say)
+/// is a false-positive edge case this doesn't try to distinguish.
+fn title_sort_key(title: &str) -> String {
+    let lower = title.to_lowercase();
+    for article in ["the ", "an ", "a "] {
+        if let Some(rest) = lower.strip_prefix(article) {
+            return rest.to_string();
+        }
+    }
+    lower
+}
+
+fn filtered_and_sorted<'a>(entries: &'a [LibraryEntry], filters: &FilterState) -> Vec<&'a LibraryEntry> {
+    let query = filters.query.borrow();
+    let status = *filters.status.borrow();
+    let language = filters.language.borrow();
+    let sort = *filters.sort.borrow();
+
+    let mut result: Vec<&LibraryEntry> = entries
+        .iter()
+        .filter(|e| {
+            (query.is_empty()
+                || e.title.to_lowercase().contains(&*query)
+                || e.author.as_deref().map(|a| a.to_lowercase().contains(&*query)).unwrap_or(false))
+                && status.matches(e)
+                && language.as_deref().map(|l| e.language.as_deref() == Some(l)).unwrap_or(true)
+        })
+        .collect();
+
+    result.sort_by(|a, b| match sort {
+        SortMode::TitleAsc => title_sort_key(&a.title).cmp(&title_sort_key(&b.title)),
+        SortMode::TitleDesc => title_sort_key(&b.title).cmp(&title_sort_key(&a.title)),
+        SortMode::AuthorAsc => author_sort_key(a.author.as_deref().unwrap_or("")).cmp(&author_sort_key(b.author.as_deref().unwrap_or(""))),
+        SortMode::AuthorDesc => author_sort_key(b.author.as_deref().unwrap_or("")).cmp(&author_sort_key(a.author.as_deref().unwrap_or(""))),
+        SortMode::RecentlyOpened => b.last_opened_at.cmp(&a.last_opened_at),
+        SortMode::RecentlyAdded => b.added_at.cmp(&a.added_at),
+        SortMode::Progress => {
+            b.last_position_percent.unwrap_or(0.0).partial_cmp(&a.last_position_percent.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal)
+        }
+    });
+    result
+}
+
+/// A single "142 books \u{b7} 12 in progress \u{b7} ..." summary line. The
+/// status/author/language breakdown is always over the *whole* library, not
+/// the currently filtered subset -- an at-a-glance overview should describe
+/// everything you have, not just what a filter happens to be showing right
+/// now. `visible` (the search/filter/status result count) only changes the
+/// leading segment's wording, to "Showing N of M books" when a filter is
+/// actually narrowing anything down.
+fn library_stats(entries: &[LibraryEntry], visible: usize) -> String {
+    let total = entries.len();
+    if total == 0 {
+        return String::new();
+    }
+
+    let unread = entries.iter().filter(|e| reading_status(e) == ReadingStatus::Unread).count();
+    let in_progress = entries.iter().filter(|e| reading_status(e) == ReadingStatus::InProgress).count();
+    let finished = entries.iter().filter(|e| reading_status(e) == ReadingStatus::Finished).count();
+    let authors: HashSet<&str> = entries.iter().filter_map(|e| e.author.as_deref()).collect();
+    let languages: HashSet<&str> = entries.iter().filter_map(|e| e.language.as_deref()).collect();
+
+    let mut parts = if visible == total {
+        vec![format!("{total} book{}", if total == 1 { "" } else { "s" })]
+    } else {
+        vec![format!("Showing {visible} of {total} book{}", if total == 1 { "" } else { "s" })]
+    };
+    if in_progress > 0 {
+        parts.push(format!("{in_progress} in progress"));
+    }
+    if finished > 0 {
+        parts.push(format!("{finished} finished"));
+    }
+    parts.push(format!("{unread} unread"));
+    parts.push(format!("{} author{}", authors.len(), if authors.len() == 1 { "" } else { "s" }));
+    if languages.len() > 1 {
+        parts.push(format!("{} languages", languages.len()));
+    }
+    parts.join(" \u{b7} ")
+}
+
+/// Rebuilds the language dropdown's options from whatever languages are
+/// actually present in `entries` -- "All languages" is always index 0.
+/// Re-selecting whatever `language` currently holds (or resetting it to
+/// "All" if that language no longer appears in the library, e.g. its last
+/// book was removed) means this is safe to call on every refresh without
+/// the dropdown's selection silently drifting from the filter it's
+/// supposed to represent.
+/// `handler_id` is the language dropdown's own `selected-notify` handler
+/// (filled in once it's connected -- see `build_library_page`) -- swapping
+/// in a brand new `StringList` model below turns out to *always* fire
+/// `selected-notify`, even when the resolved index ends up unchanged (a
+/// model replacement isn't a simple property value change GObject can
+/// diff against its old value the way it does for a plain setter). Left
+/// unblocked, that fired the connected handler, which called `refresh_ui`,
+/// which called back in here, forever -- confirmed live as an app freeze
+/// the moment any *other* filter/sort control triggered a refresh after
+/// the language dropdown's handler existed. Blocking it for the duration
+/// of this resync is what actually breaks the loop.
+fn rebuild_language_dropdown(
+    dropdown: &DropDown,
+    entries: &[LibraryEntry],
+    language: &Rc<RefCell<Option<String>>>,
+    handler_id: &Rc<RefCell<Option<glib::SignalHandlerId>>>,
+) {
+    let guard = handler_id.borrow();
+    if let Some(id) = guard.as_ref() {
+        dropdown.block_signal(id);
+    }
+
+    let mut langs: Vec<String> = entries.iter().filter_map(|e| e.language.clone()).collect::<HashSet<_>>().into_iter().collect();
+    langs.sort();
+
+    let mut labels: Vec<&str> = vec!["All languages"];
+    labels.extend(langs.iter().map(|s| s.as_str()));
+    dropdown.set_model(Some(&StringList::new(&labels)));
+
+    let current = language.borrow().clone();
+    let selected_index = current.as_deref().and_then(|cur| langs.iter().position(|l| l == cur)).map(|i| i as u32 + 1).unwrap_or(0);
+    dropdown.set_selected(selected_index);
+    if selected_index == 0 && current.is_some() {
+        *language.borrow_mut() = None;
+    }
+
+    if let Some(id) = guard.as_ref() {
+        dropdown.unblock_signal(id);
+    }
 }
 
 /// Builds the library page's root widget and returns it alongside a
@@ -47,7 +300,7 @@ pub fn build_library_page(window: &ApplicationWindow, on_open: Rc<dyn Fn(&str)>)
 
     let entries: Rc<RefCell<Vec<LibraryEntry>>> = Rc::new(RefCell::new(persistence::read_library(&config_dir)?));
     let cover_cache: CoverCache = Rc::new(RefCell::new(HashMap::new()));
-    let query: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+    let filters = FilterState::new();
 
     let flowbox = FlowBox::new();
     // Unlike a plain Box, GtkScrolledWindow doesn't stretch its child to
@@ -56,6 +309,14 @@ pub fn build_library_page(window: &ApplicationWindow, on_open: Rc<dyn Fn(&str)>)
     // ever saw its own minimal natural width and never reflowed into extra
     // columns no matter how wide the window got.
     flowbox.set_hexpand(true);
+    // Default `valign` is `Fill`, which (inside the `vexpand`ing scroller
+    // below) stretches the flowbox to the *whole* viewport height whenever
+    // its own content is shorter than that -- e.g. a single search result.
+    // FlowBox then distributes that leftover space into the last row's own
+    // cells rather than leaving it empty, so the hover/click highlight on a
+    // lone card ends up covering the entire remaining page, not just the
+    // card. `Start` caps it at its natural (content) height instead.
+    flowbox.set_valign(Align::Start);
     flowbox.set_selection_mode(SelectionMode::None);
     flowbox.set_homogeneous(true);
     flowbox.set_row_spacing(16);
@@ -107,6 +368,48 @@ pub fn build_library_page(window: &ApplicationWindow, on_open: Rc<dyn Fn(&str)>)
     toolbar.append(&status_label);
     toolbar.append(&import_row);
 
+    let sort_labels: Vec<&str> = SortMode::ALL.iter().map(|s| s.label()).collect();
+    let sort_dropdown = DropDown::from_strings(&sort_labels);
+    sort_dropdown.set_tooltip_text(Some("Sort by"));
+
+    let status_row = GtkBox::new(Orientation::Horizontal, 0);
+    status_row.add_css_class("linked");
+    let mut first_status_btn: Option<ToggleButton> = None;
+    let mut status_buttons: Vec<(StatusFilter, ToggleButton)> = Vec::new();
+    for status in StatusFilter::ALL {
+        let btn = ToggleButton::builder().label(status.label()).build();
+        match &first_status_btn {
+            Some(first) => btn.set_group(Some(first)),
+            None => first_status_btn = Some(btn.clone()),
+        }
+        if status == StatusFilter::All {
+            btn.set_active(true);
+        }
+        status_row.append(&btn);
+        status_buttons.push((status, btn));
+    }
+
+    // Populated for real by `refresh_ui`'s first run, once the language
+    // dropdown has entries to build its options from -- see
+    // `rebuild_language_dropdown`.
+    let language_dropdown = DropDown::from_strings(&["All languages"]);
+    language_dropdown.set_tooltip_text(Some("Filter by language"));
+
+    let filter_row = GtkBox::new(Orientation::Horizontal, 8);
+    filter_row.set_margin_start(16);
+    filter_row.set_margin_end(16);
+    filter_row.set_margin_bottom(4);
+    filter_row.append(&sort_dropdown);
+    filter_row.append(&status_row);
+    filter_row.append(&language_dropdown);
+
+    let stats_label = Label::new(None);
+    stats_label.set_halign(Align::Start);
+    stats_label.set_margin_start(16);
+    stats_label.set_margin_end(16);
+    stats_label.set_margin_bottom(8);
+    stats_label.add_css_class("dim-label");
+
     let scroller =
         ScrolledWindow::builder().child(&flowbox).hscrollbar_policy(PolicyType::Never).hexpand(true).vexpand(true).build();
 
@@ -144,57 +447,157 @@ pub fn build_library_page(window: &ApplicationWindow, on_open: Rc<dyn Fn(&str)>)
 
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.append(&toolbar);
+    root.append(&filter_row);
+    root.append(&stats_label);
     root.append(&content_stack);
 
-    rebuild_flowbox(&flowbox, &entries.borrow(), &query.borrow(), &cover_cache, &on_open, &content_stack);
+    // Everything downstream of "the entries list or a filter changed" goes
+    // through this one closure -- re-derives the language dropdown's
+    // options, re-renders the grid, and refreshes the stats line. Every
+    // control below just updates its own bit of `filters`/`entries` and
+    // calls this, instead of each one separately threading the same six
+    // widgets through its own call to `rebuild_flowbox`.
+    // Filled in once the language dropdown's own `selected-notify` handler
+    // is connected below -- `rebuild_language_dropdown` needs it to block
+    // that handler during its own programmatic model/selection resync (see
+    // that function's doc comment for why that's not optional). `None`
+    // during this closure's very first call (right below) is fine: no
+    // handler exists yet to loop through at that point regardless.
+    let language_handler_id: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::new(RefCell::new(None));
 
-    {
+    // Lets `rebuild_flowbox`'s per-card language-edit button trigger a full
+    // `refresh_ui` after saving, without `refresh_ui` needing to pass
+    // *itself* into a function it calls (which `Rc`'s ordinary construction
+    // can't do directly) -- filled in right after `refresh_ui` exists,
+    // before anything user-driven can reach the card that reads it.
+    let refresh_ui_cell: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+
+    // Everything downstream of "the entries list or a filter changed" goes
+    // through this one closure -- re-derives the language dropdown's
+    // options, re-renders the grid, and refreshes the stats line. Every
+    // control below just updates its own bit of `filters`/`entries` and
+    // calls this, instead of each one separately threading the same six
+    // widgets through its own call to `rebuild_flowbox`.
+    let refresh_ui: Rc<dyn Fn()> = {
         let flowbox = flowbox.clone();
         let entries = entries.clone();
+        let filters = filters.clone();
         let cover_cache = cover_cache.clone();
-        let query = query.clone();
         let on_open = on_open.clone();
         let content_stack = content_stack.clone();
+        let search_entry = search_entry.clone();
+        let language_dropdown = language_dropdown.clone();
+        let language_handler_id = language_handler_id.clone();
+        let stats_label = stats_label.clone();
+        let config_dir = config_dir.clone();
+        let refresh_ui_cell = refresh_ui_cell.clone();
+        Rc::new(move || {
+            rebuild_language_dropdown(&language_dropdown, &entries.borrow(), &filters.language, &language_handler_id);
+            let visible = filtered_and_sorted(&entries.borrow(), &filters).len();
+            rebuild_flowbox(
+                &flowbox,
+                &entries.borrow(),
+                &entries,
+                &filters,
+                &cover_cache,
+                &on_open,
+                &content_stack,
+                &search_entry,
+                &config_dir,
+                &refresh_ui_cell,
+            );
+            stats_label.set_text(&library_stats(&entries.borrow(), visible));
+        })
+    };
+    *refresh_ui_cell.borrow_mut() = Some(refresh_ui.clone());
+    refresh_ui();
+    spawn_language_backfill(config_dir.clone(), entries.clone(), refresh_ui.clone());
+
+    {
+        let filters = filters.clone();
+        let refresh_ui = refresh_ui.clone();
         search_entry.connect_changed(move |entry| {
-            *query.borrow_mut() = entry.text().to_lowercase();
-            rebuild_flowbox(&flowbox, &entries.borrow(), &query.borrow(), &cover_cache, &on_open, &content_stack);
+            *filters.query.borrow_mut() = entry.text().to_lowercase();
+            refresh_ui();
         });
+    }
+
+    {
+        let filters = filters.clone();
+        let refresh_ui = refresh_ui.clone();
+        sort_dropdown.connect_selected_notify(move |dd| {
+            if let Some(mode) = SortMode::ALL.get(dd.selected() as usize) {
+                *filters.sort.borrow_mut() = *mode;
+                refresh_ui();
+            }
+        });
+    }
+
+    for (status, btn) in status_buttons {
+        let filters = filters.clone();
+        let refresh_ui = refresh_ui.clone();
+        btn.connect_toggled(move |b| {
+            if b.is_active() {
+                *filters.status.borrow_mut() = status;
+                refresh_ui();
+            }
+        });
+    }
+
+    {
+        let filters = filters.clone();
+        let refresh_ui = refresh_ui.clone();
+        let id = language_dropdown.connect_selected_notify(move |dd| {
+            let selected = if dd.selected() == 0 {
+                None
+            } else {
+                dd.selected_item().and_then(|o| o.downcast::<StringObject>().ok()).map(|s| s.string().to_string())
+            };
+            *filters.language.borrow_mut() = selected;
+            // Deferred to the next main-loop iteration, not called inline:
+            // `refresh_ui` (via `rebuild_language_dropdown`) replaces *this
+            // same dropdown's* model, and doing that synchronously from
+            // inside its own `selected-notify` handler raced with GTK's own
+            // still-unwinding internal click handling for the popover list
+            // item just selected -- confirmed live as a
+            // `g_object_notify_by_pspec: assertion 'G_IS_OBJECT (object)'
+            // failed` crash. Letting that unwind fully first (one
+            // `idle_add_local_once` hop) fixed it.
+            let refresh_ui = refresh_ui.clone();
+            glib::idle_add_local_once(move || refresh_ui());
+        });
+        // See `rebuild_language_dropdown`'s doc comment: this handler must
+        // be blocked while that function resyncs the dropdown's model, or
+        // the two call each other forever.
+        *language_handler_id.borrow_mut() = Some(id);
     }
 
     {
         let window = window.clone();
         let config_dir = config_dir.clone();
         let books_dir = books_dir.clone();
-        let flowbox = flowbox.clone();
         let entries = entries.clone();
-        let cover_cache = cover_cache.clone();
-        let query = query.clone();
-        let on_open = on_open.clone();
         let import_ui = import_ui.clone();
-        let content_stack = content_stack.clone();
+        let refresh_ui = refresh_ui.clone();
         import_book_btn.connect_clicked(move |_| {
-            let filter = FileFilter::new();
-            filter.set_name(Some("EPUB books"));
-            filter.add_suffix("epub");
-            let filters = gio::ListStore::new::<FileFilter>();
-            filters.append(&filter);
+            let epub_filter = FileFilter::new();
+            epub_filter.set_name(Some("EPUB books"));
+            epub_filter.add_suffix("epub");
+            let file_filters = gio::ListStore::new::<FileFilter>();
+            file_filters.append(&epub_filter);
 
             let dialog = FileDialog::builder().title("Import EPUB").accept_label("Import").build();
-            dialog.set_filters(Some(&filters));
+            dialog.set_filters(Some(&file_filters));
 
             let config_dir = config_dir.clone();
             let books_dir = books_dir.clone();
-            let flowbox = flowbox.clone();
             let entries = entries.clone();
-            let cover_cache = cover_cache.clone();
-            let query = query.clone();
-            let on_open = on_open.clone();
             let import_ui = import_ui.clone();
-            let content_stack = content_stack.clone();
+            let refresh_ui = refresh_ui.clone();
             dialog.open(Some(&window), gio::Cancellable::NONE, move |result| {
                 let Ok(file) = result else { return };
                 let Some(path) = file.path() else { return };
-                spawn_import_one(config_dir, books_dir, path, flowbox, entries, cover_cache, query, on_open, import_ui, content_stack);
+                spawn_import_one(config_dir, books_dir, path, entries, import_ui, refresh_ui);
             });
         });
     }
@@ -203,73 +606,62 @@ pub fn build_library_page(window: &ApplicationWindow, on_open: Rc<dyn Fn(&str)>)
         let window = window.clone();
         let config_dir = config_dir.clone();
         let books_dir = books_dir.clone();
-        let flowbox = flowbox.clone();
         let entries = entries.clone();
-        let cover_cache = cover_cache.clone();
-        let query = query.clone();
-        let on_open = on_open.clone();
         let import_ui = import_ui.clone();
-        let content_stack = content_stack.clone();
+        let refresh_ui = refresh_ui.clone();
         import_folder_btn.connect_clicked(move |_| {
             let dialog = FileDialog::builder().title("Import Folder of EPUBs").accept_label("Import").build();
 
             let config_dir = config_dir.clone();
             let books_dir = books_dir.clone();
-            let flowbox = flowbox.clone();
             let entries = entries.clone();
-            let cover_cache = cover_cache.clone();
-            let query = query.clone();
-            let on_open = on_open.clone();
             let import_ui = import_ui.clone();
-            let content_stack = content_stack.clone();
+            let refresh_ui = refresh_ui.clone();
             dialog.select_folder(Some(&window), gio::Cancellable::NONE, move |result| {
                 let Ok(file) = result else { return };
                 let Some(path) = file.path() else { return };
-                spawn_import_folder(config_dir, books_dir, path, flowbox, entries, cover_cache, query, on_open, import_ui, content_stack);
+                spawn_import_folder(config_dir, books_dir, path, entries, import_ui, refresh_ui);
             });
         });
     }
 
     let refresh: Rc<dyn Fn()> = {
-        let flowbox = flowbox.clone();
         let entries = entries.clone();
-        let cover_cache = cover_cache.clone();
-        let query = query.clone();
-        let on_open = on_open.clone();
         let config_dir = config_dir.clone();
-        let content_stack = content_stack.clone();
+        let refresh_ui = refresh_ui.clone();
         Rc::new(move || {
             if let Ok(fresh) = persistence::read_library(&config_dir) {
                 *entries.borrow_mut() = fresh;
             }
-            rebuild_flowbox(&flowbox, &entries.borrow(), &query.borrow(), &cover_cache, &on_open, &content_stack);
+            refresh_ui();
         })
     };
 
     Ok((root, refresh))
 }
 
-fn filtered<'a>(entries: &'a [LibraryEntry], query: &str) -> Vec<&'a LibraryEntry> {
-    if query.is_empty() {
-        return entries.iter().collect();
-    }
-    entries
-        .iter()
-        .filter(|e| {
-            e.title.to_lowercase().contains(query)
-                || e.author.as_deref().map(|a| a.to_lowercase().contains(query)).unwrap_or(false)
-        })
-        .collect()
-}
-
+/// `search_entry` is only needed for the author button's click handler
+/// (jumps to that author by populating the free-text search, see the note
+/// on that below) -- everything else about *which* entries render and in
+/// what order comes from `filters`. `entries_rc`/`config_dir` are only for
+/// the language-edit button's save action (persist + update the shared
+/// in-memory list); `refresh_ui_cell` is how that action re-triggers a full
+/// refresh afterward without `rebuild_flowbox` needing `refresh_ui` passed
+/// in directly, which would be self-referential (`refresh_ui` is itself the
+/// thing that calls `rebuild_flowbox`) -- filled in once, right after
+/// `refresh_ui` is constructed, before anything can click a card.
 #[allow(clippy::too_many_arguments)]
 fn rebuild_flowbox(
     flowbox: &FlowBox,
     entries: &[LibraryEntry],
-    query: &str,
+    entries_rc: &Rc<RefCell<Vec<LibraryEntry>>>,
+    filters: &FilterState,
     cover_cache: &CoverCache,
     on_open: &Rc<dyn Fn(&str)>,
     content_stack: &gtk::Stack,
+    search_entry: &SearchEntry,
+    config_dir: &Rc<PathBuf>,
+    refresh_ui_cell: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
 ) {
     content_stack.set_visible_child_name(if entries.is_empty() { "empty" } else { "grid" });
 
@@ -279,7 +671,7 @@ fn rebuild_flowbox(
 
     let mut pending = Vec::new();
 
-    for entry in filtered(entries, query) {
+    for entry in filtered_and_sorted(entries, filters) {
         let picture = Picture::new();
         picture.set_can_shrink(true);
         picture.set_content_fit(gtk::ContentFit::Contain);
@@ -311,16 +703,133 @@ fn rebuild_flowbox(
         title.set_max_width_chars(14);
         title.add_css_class("heading");
 
-        let author = Label::new(entry.author.as_deref());
-        author.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        author.set_max_width_chars(14);
-        author.add_css_class("dim-label");
+        // Cover + title are the "open this book" target; the author line
+        // deliberately sits *outside* that button rather than inside the
+        // same card widget it's built from, below -- GTK buttons nested
+        // inside other buttons fight over click handling, so when the
+        // author needs its own click target (jump to their other books),
+        // it has to be a sibling of the open-button, not a child of it.
+        let open_card = GtkBox::new(Orientation::Vertical, 4);
+        open_card.append(&picture);
+        open_card.append(&title);
+        let open_btn = Button::builder().child(&open_card).has_frame(false).build();
+        let path = entry.path.clone();
+        let on_open = on_open.clone();
+        open_btn.connect_clicked(move |_| on_open(&path));
 
         let card = GtkBox::new(Orientation::Vertical, 4);
         card.set_width_request(COVER_WIDTH + 20);
-        card.append(&picture);
-        card.append(&title);
-        card.append(&author);
+        card.append(&open_btn);
+
+        let meta_row = GtkBox::new(Orientation::Horizontal, 2);
+        if let Some(author_name) = entry.author.clone() {
+            let author_label = Label::new(Some(&author_name));
+            author_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            author_label.set_max_width_chars(12);
+            author_label.add_css_class("dim-label");
+            author_label.set_hexpand(true);
+            author_label.set_halign(Align::Start);
+
+            let author_btn = Button::builder().child(&author_label).has_frame(false).hexpand(true).build();
+            author_btn.set_tooltip_text(Some(&format!("Show books by {author_name}")));
+            let search_entry = search_entry.clone();
+            author_btn.connect_clicked(move |_| {
+                // Reuses the existing free-text search rather than a
+                // separate "author filter" dimension -- simpler state, and
+                // correct for the common case; the one edge case (two
+                // authors whose names happen to share a substring) isn't
+                // worth a dedicated exact-match filter for a library
+                // browser this size.
+                search_entry.set_text(&author_name);
+            });
+            meta_row.append(&author_btn);
+        }
+
+        let edit_lang_btn = Button::from_icon_name("document-edit-symbolic");
+        edit_lang_btn.set_has_frame(false);
+        edit_lang_btn.set_tooltip_text(Some("Edit language metadata"));
+        edit_lang_btn.add_css_class("flat");
+        {
+            let path = entry.path.clone();
+            let current_language = entry.language.clone();
+            let config_dir = config_dir.clone();
+            let entries_rc = entries_rc.clone();
+            let refresh_ui_cell = refresh_ui_cell.clone();
+            let edit_lang_btn_c = edit_lang_btn.clone();
+            edit_lang_btn.connect_clicked(move |_| {
+                // A fresh Popover every click, never a mutated live one --
+                // same reasoning as every other popover in this app (see
+                // dictionary_ui.rs).
+                let popover = gtk::Popover::new();
+                popover.set_parent(&edit_lang_btn_c);
+
+                let content = GtkBox::new(Orientation::Vertical, 6);
+                content.set_margin_top(8);
+                content.set_margin_bottom(8);
+                content.set_margin_start(8);
+                content.set_margin_end(8);
+                content.set_width_request(200);
+
+                let hint = Label::new(Some("Language code (e.g. en, fr, de) -- some source EPUBs, public-domain scans especially, declare the wrong one or none at all."));
+                hint.set_wrap(true);
+                hint.set_halign(Align::Start);
+                hint.add_css_class("dim-label");
+                content.append(&hint);
+
+                let language_entry = gtk::Entry::new();
+                language_entry.set_text(current_language.as_deref().unwrap_or(""));
+                content.append(&language_entry);
+
+                let btn_row = GtkBox::new(Orientation::Horizontal, 6);
+                let clear_btn = Button::with_label("Clear");
+                let save_btn = Button::with_label("Save");
+                save_btn.add_css_class("suggested-action");
+                btn_row.append(&clear_btn);
+                btn_row.append(&save_btn);
+                content.append(&btn_row);
+
+                popover.set_child(Some(&content));
+
+                let apply = {
+                    let path = path.clone();
+                    let config_dir = config_dir.clone();
+                    let entries_rc = entries_rc.clone();
+                    let refresh_ui_cell = refresh_ui_cell.clone();
+                    let popover = popover.clone();
+                    move |language: Option<&str>| {
+                        let _ = persistence::set_library_entry_language(&config_dir, &path, language);
+                        if let Some(e) = entries_rc.borrow_mut().iter_mut().find(|e| e.path == path) {
+                            e.language = language.map(|s| s.to_string());
+                        }
+                        popover.popdown();
+                        if let Some(refresh_ui) = refresh_ui_cell.borrow().clone() {
+                            refresh_ui();
+                        }
+                    }
+                };
+                {
+                    let apply = apply.clone();
+                    let language_entry = language_entry.clone();
+                    save_btn.connect_clicked(move |_| {
+                        let text = language_entry.text().trim().to_string();
+                        apply(if text.is_empty() { None } else { Some(text.as_str()) });
+                    });
+                }
+                {
+                    // Enter in the entry submits, same as clicking Save.
+                    let apply = apply.clone();
+                    language_entry.connect_activate(move |entry| {
+                        let text = entry.text().trim().to_string();
+                        apply(if text.is_empty() { None } else { Some(text.as_str()) });
+                    });
+                }
+                clear_btn.connect_clicked(move |_| apply(None));
+
+                popover.popup();
+            });
+        }
+        meta_row.append(&edit_lang_btn);
+        card.append(&meta_row);
 
         if let Some(percent) = entry.last_position_percent {
             let progress = ProgressBar::new();
@@ -329,19 +838,72 @@ fn rebuild_flowbox(
             card.append(&progress);
         }
 
-        let button = Button::builder().child(&card).has_frame(false).build();
-        let path = entry.path.clone();
-        let on_open = on_open.clone();
-        button.connect_clicked(move |_| {
-            on_open(&path);
-        });
-
-        flowbox.append(&button);
+        flowbox.append(&card);
     }
 
     if !pending.is_empty() {
         spawn_lazy_cover_decode(pending, cover_cache.clone());
     }
+}
+
+/// One-time background pass filling in `language` for every library entry
+/// that predates that field -- anything imported (or last opened) before
+/// language capture existed. Without this, the language filter would stay
+/// permanently empty for a whole pre-existing library until each book
+/// happened to be opened individually (app.rs's own reader-open path
+/// already backfills one book at a time, but that's a poor substitute for
+/// "the filter actually has options in it"). Runs once per library-page
+/// load (see its call site), not on every refresh -- once `library.json` is
+/// rewritten with the real value, an entry never needs this again.
+fn spawn_language_backfill(config_dir: Rc<PathBuf>, entries: Rc<RefCell<Vec<LibraryEntry>>>, refresh_ui: Rc<dyn Fn()>) {
+    let paths: Vec<String> = entries.borrow().iter().filter(|e| e.language.is_none()).map(|e| e.path.clone()).collect();
+    if paths.is_empty() {
+        return;
+    }
+
+    let (tx, rx) = mpsc::channel::<(String, Option<String>)>();
+    std::thread::spawn(move || {
+        for path in paths {
+            let language = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .ok()
+                .and_then(|conn| weland::db::load_metadata(&conn).ok())
+                .and_then(|metadata| metadata.get("language").cloned())
+                .filter(|lang| !lang.is_empty());
+            if tx.send((path, language)).is_err() {
+                break;
+            }
+        }
+    });
+
+    glib::timeout_add_local(Duration::from_millis(150), move || {
+        let mut updated = false;
+        loop {
+            match rx.try_recv() {
+                Ok((path, language)) => {
+                    if language.is_some() {
+                        if let Some(entry) = entries.borrow_mut().iter_mut().find(|e| e.path == path) {
+                            entry.language = language;
+                            updated = true;
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    if updated {
+                        let _ = persistence::write_library(&config_dir, &entries.borrow());
+                        refresh_ui();
+                    }
+                    return glib::ControlFlow::Continue;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if updated {
+                        let _ = persistence::write_library(&config_dir, &entries.borrow());
+                        refresh_ui();
+                    }
+                    return glib::ControlFlow::Break;
+                }
+            }
+        }
+    });
 }
 
 /// Decodes covers a couple at a time on `glib` idle callbacks, same pattern
@@ -475,18 +1037,13 @@ impl ImportUi {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_import_one(
     config_dir: Rc<PathBuf>,
     books_dir: Rc<PathBuf>,
     input: PathBuf,
-    flowbox: FlowBox,
     entries: Rc<RefCell<Vec<LibraryEntry>>>,
-    cover_cache: CoverCache,
-    query: Rc<RefCell<String>>,
-    on_open: Rc<dyn Fn(&str)>,
     import_ui: ImportUi,
-    content_stack: gtk::Stack,
+    refresh_ui: Rc<dyn Fn()>,
 ) {
     let (tx, rx) = mpsc::channel::<ImportMsg>();
     import_ui.start("Importing\u{2026} (you can keep browsing or open a book meanwhile)");
@@ -516,22 +1073,17 @@ fn spawn_import_one(
         if let Ok(fresh) = persistence::read_library(&config_dir) {
             *entries.borrow_mut() = fresh;
         }
-        rebuild_flowbox(&flowbox, &entries.borrow(), &query.borrow(), &cover_cache, &on_open, &content_stack);
+        refresh_ui();
     });
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_import_folder(
     config_dir: Rc<PathBuf>,
     books_dir: Rc<PathBuf>,
     root: PathBuf,
-    flowbox: FlowBox,
     entries: Rc<RefCell<Vec<LibraryEntry>>>,
-    cover_cache: CoverCache,
-    query: Rc<RefCell<String>>,
-    on_open: Rc<dyn Fn(&str)>,
     import_ui: ImportUi,
-    content_stack: gtk::Stack,
+    refresh_ui: Rc<dyn Fn()>,
 ) {
     let (tx, rx) = mpsc::channel::<ImportMsg>();
     import_ui.start("Importing folder\u{2026} (you can keep browsing or open a book meanwhile)");
@@ -571,14 +1123,10 @@ fn spawn_import_folder(
     poll_import(
         rx,
         {
-            let flowbox = flowbox.clone();
             let entries = entries.clone();
-            let cover_cache = cover_cache.clone();
-            let query = query.clone();
-            let on_open = on_open.clone();
             let config_dir = config_dir.clone();
-            let content_stack = content_stack.clone();
             let import_ui = import_ui.clone();
+            let refresh_ui = refresh_ui.clone();
             move |done, total| {
                 import_ui.label.set_text(&format!(
                     "Importing folder\u{2026} {done}/{total} (you can keep browsing or open a book meanwhile)"
@@ -586,7 +1134,7 @@ fn spawn_import_folder(
                 if let Ok(fresh) = persistence::read_library(&config_dir) {
                     *entries.borrow_mut() = fresh;
                 }
-                rebuild_flowbox(&flowbox, &entries.borrow(), &query.borrow(), &cover_cache, &on_open, &content_stack);
+                refresh_ui();
             }
         },
         move |msg| {
@@ -602,7 +1150,7 @@ fn spawn_import_folder(
             if let Ok(fresh) = persistence::read_library(&config_dir) {
                 *entries.borrow_mut() = fresh;
             }
-            rebuild_flowbox(&flowbox, &entries.borrow(), &query.borrow(), &cover_cache, &on_open, &content_stack);
+            refresh_ui();
         },
     );
 }
@@ -644,7 +1192,13 @@ fn import_one(config_dir: &std::path::Path, books_dir: &std::path::Path, input: 
     let title = metadata.get("title").cloned().unwrap_or_else(|| {
         input.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Untitled".to_string())
     });
-    persistence::upsert_library_entry(config_dir, &output.to_string_lossy(), &title, metadata.get("author").map(|s| s.as_str()))?;
+    persistence::upsert_library_entry(
+        config_dir,
+        &output.to_string_lossy(),
+        &title,
+        metadata.get("author").map(|s| s.as_str()),
+        metadata.get("language").map(|s| s.as_str()),
+    )?;
     Ok(())
 }
 
@@ -666,4 +1220,167 @@ fn find_epubs_recursive(root: &std::path::Path) -> Vec<PathBuf> {
         }
     }
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(title: &str, author: Option<&str>, language: Option<&str>, added_at: i64, last_opened_at: i64, percent: Option<f64>) -> LibraryEntry {
+        LibraryEntry {
+            path: format!("/books/{title}.wld"),
+            title: title.to_string(),
+            author: author.map(String::from),
+            added_at,
+            last_opened_at,
+            last_position_node_id: percent.map(|_| 1),
+            last_position_percent: percent,
+            language: language.map(String::from),
+        }
+    }
+
+    #[test]
+    fn reading_status_buckets_by_percent() {
+        assert_eq!(reading_status(&entry("A", None, None, 0, 0, None)), ReadingStatus::Unread);
+        assert_eq!(reading_status(&entry("A", None, None, 0, 0, Some(0.0))), ReadingStatus::Unread);
+        assert_eq!(reading_status(&entry("A", None, None, 0, 0, Some(0.5))), ReadingStatus::InProgress);
+        assert_eq!(reading_status(&entry("A", None, None, 0, 0, Some(0.99))), ReadingStatus::Finished);
+        assert_eq!(reading_status(&entry("A", None, None, 0, 0, Some(FINISHED_THRESHOLD))), ReadingStatus::Finished);
+    }
+
+    #[test]
+    fn filtered_and_sorted_applies_query_status_and_language_together() {
+        let entries = vec![
+            entry("Beowulf", Some("Unknown"), Some("en"), 1, 1, None),
+            entry("The Poetic Edda", Some("Snorri Sturluson"), Some("en"), 2, 2, Some(0.5)),
+            entry("Faust", Some("Goethe"), Some("de"), 3, 3, Some(1.0)),
+        ];
+        let filters = FilterState::new();
+
+        // No filters: everything, default sort (RecentlyOpened) puts the
+        // highest last_opened_at first.
+        let all = filtered_and_sorted(&entries, &filters);
+        assert_eq!(all.iter().map(|e| e.title.as_str()).collect::<Vec<_>>(), vec!["Faust", "The Poetic Edda", "Beowulf"]);
+
+        *filters.status.borrow_mut() = StatusFilter::InProgress;
+        let in_progress = filtered_and_sorted(&entries, &filters);
+        assert_eq!(in_progress.len(), 1);
+        assert_eq!(in_progress[0].title, "The Poetic Edda");
+
+        *filters.status.borrow_mut() = StatusFilter::All;
+        *filters.language.borrow_mut() = Some("de".to_string());
+        let german = filtered_and_sorted(&entries, &filters);
+        assert_eq!(german.len(), 1);
+        assert_eq!(german[0].title, "Faust");
+
+        *filters.language.borrow_mut() = None;
+        *filters.query.borrow_mut() = "poetic".to_string();
+        let searched = filtered_and_sorted(&entries, &filters);
+        assert_eq!(searched.len(), 1);
+        assert_eq!(searched[0].title, "The Poetic Edda");
+    }
+
+    #[test]
+    fn filtered_and_sorted_query_matches_author_too() {
+        let entries = vec![entry("The Poetic Edda", Some("Snorri Sturluson"), None, 1, 1, None)];
+        let filters = FilterState::new();
+        *filters.query.borrow_mut() = "sturluson".to_string();
+        assert_eq!(filtered_and_sorted(&entries, &filters).len(), 1);
+    }
+
+    #[test]
+    fn sort_modes_order_correctly() {
+        let entries = vec![
+            entry("Zeta", Some("Zed"), None, 100, 10, Some(0.1)),
+            entry("Alpha", Some("Anne"), None, 200, 20, Some(0.9)),
+        ];
+        let filters = FilterState::new();
+
+        *filters.sort.borrow_mut() = SortMode::TitleAsc;
+        assert_eq!(filtered_and_sorted(&entries, &filters)[0].title, "Alpha");
+
+        *filters.sort.borrow_mut() = SortMode::TitleDesc;
+        assert_eq!(filtered_and_sorted(&entries, &filters)[0].title, "Zeta");
+
+        *filters.sort.borrow_mut() = SortMode::AuthorAsc;
+        assert_eq!(filtered_and_sorted(&entries, &filters)[0].author.as_deref(), Some("Anne"));
+
+        *filters.sort.borrow_mut() = SortMode::AuthorDesc;
+        assert_eq!(filtered_and_sorted(&entries, &filters)[0].author.as_deref(), Some("Zed"));
+
+        *filters.sort.borrow_mut() = SortMode::RecentlyAdded;
+        assert_eq!(filtered_and_sorted(&entries, &filters)[0].title, "Alpha");
+
+        *filters.sort.borrow_mut() = SortMode::Progress;
+        assert_eq!(filtered_and_sorted(&entries, &filters)[0].title, "Alpha");
+    }
+
+    #[test]
+    fn author_sort_uses_surname_not_full_name() {
+        assert_eq!(author_sort_key("George R. R. Martin"), "martin");
+        assert_eq!(author_sort_key("Amy Adams"), "adams");
+
+        // First-name order and surname order disagree for this pair --
+        // "Amy" < "Zoe" but "martin" < "wells", so this only passes if
+        // sorting is really keying off the surname.
+        let entries = vec![
+            entry("The Hollow Crown", Some("Zoe Martin"), None, 1, 1, None),
+            entry("Faust", Some("Amy Wells"), None, 2, 2, None),
+        ];
+        let filters = FilterState::new();
+        *filters.sort.borrow_mut() = SortMode::AuthorAsc;
+        assert_eq!(filtered_and_sorted(&entries, &filters)[0].author.as_deref(), Some("Zoe Martin"));
+    }
+
+    #[test]
+    fn title_sort_ignores_leading_articles() {
+        assert_eq!(title_sort_key("The Hobbit"), "hobbit");
+        assert_eq!(title_sort_key("An American Tragedy"), "american tragedy");
+        assert_eq!(title_sort_key("A Game of Thrones"), "game of thrones");
+        // No leading article -- unaffected.
+        assert_eq!(title_sort_key("Beowulf"), "beowulf");
+
+        // "The Apple" sorts under "A" (ahead of "Banana Republic"), not "T"
+        // -- straight string comparison ("the apple" vs "banana...") would
+        // put Banana Republic first instead, since 't' > 'b'.
+        let entries = vec![
+            entry("Banana Republic", None, None, 1, 1, None),
+            entry("The Apple", None, None, 2, 2, None),
+        ];
+        let filters = FilterState::new();
+        *filters.sort.borrow_mut() = SortMode::TitleAsc;
+        assert_eq!(filtered_and_sorted(&entries, &filters)[0].title, "The Apple");
+    }
+
+    #[test]
+    fn library_stats_summarizes_the_whole_library_not_a_filtered_subset() {
+        let entries = vec![
+            entry("A", Some("X"), Some("en"), 1, 1, None),
+            entry("B", Some("Y"), Some("en"), 2, 2, Some(0.5)),
+            entry("C", Some("X"), Some("fr"), 3, 3, Some(1.0)),
+        ];
+        let stats = library_stats(&entries, entries.len());
+        assert!(stats.contains("3 books"), "{stats}");
+        assert!(stats.contains("1 in progress"), "{stats}");
+        assert!(stats.contains("1 finished"), "{stats}");
+        assert!(stats.contains("1 unread"), "{stats}");
+        assert!(stats.contains("2 authors"), "{stats}");
+        assert!(stats.contains("2 languages"), "{stats}");
+    }
+
+    #[test]
+    fn library_stats_shows_the_visible_count_when_a_filter_narrows_it() {
+        let entries = vec![
+            entry("A", Some("X"), None, 1, 1, None),
+            entry("B", Some("Y"), None, 2, 2, None),
+            entry("C", Some("X"), None, 3, 3, None),
+        ];
+        let stats = library_stats(&entries, 1);
+        assert!(stats.contains("Showing 1 of 3 books"), "{stats}");
+    }
+
+    #[test]
+    fn library_stats_is_empty_for_an_empty_library() {
+        assert_eq!(library_stats(&[], 0), "");
+    }
 }
