@@ -22,6 +22,8 @@ weland fixes this at the format level, not the app level. Every book compiles to
 
 It's a Tauri v2 app with a plain HTML/JS frontend — no bundler, no npm toolchain — and it's built sandboxed-by-default with explicit export on demand, specifically so it can ship as a real Flatpak on Flathub and on Steam, not just run from source.
 
+One deliberate choice worth naming: both readers scroll continuously rather than paginate. A page number in a reflowable format is computed from whatever font, size, and margins happen to be active right now — not a stable coordinate, a rendering artifact recalculated on the fly — so pagination's real benefit is a spatial-memory aid *within one session at fixed settings*, not a portable position; change the type size and "page 47" is a different page. That benefit is genuine, but narrow, and continuous scroll doesn't try to replicate it — this is a tradeoff, not a solved problem. What it buys back: no page-layout/reflow-on-resize engine to build and maintain, and a progress readout that's honest about what it actually is — a percentage through the content — instead of a page count implying more precision than reflowable text can back up.
+
 ## Quickstart
 
 ```sh
@@ -39,7 +41,7 @@ cd reader/src-tauri
 cargo run
 ```
 
-`gtk-reader/` is a native GTK4 rewrite of the reader (in progress) — same `weland` core, no webview. It needs `gst-plugins-good` installed at runtime for voice-note playback (`GtkMediaFile` is GStreamer-backed, and the `autoaudiosink` element it needs to reach real audio output lives in that package, not in `gst-plugins-base`). Most desktop systems already have it as a transitive dependency of a browser or video player; a minimal install may not. On Arch: `sudo pacman -S gst-plugins-good`.
+`gtk-reader/` is a native GTK4 rewrite of the reader — same `weland` core, no webview. TOC, highlight/note/voice-note annotations, full-text search, dictionary lookup with a vocab builder, a preferences dialog, remappable keyboard shortcuts, a pan/zoom image viewer, and a library view with sort/filter/stats and per-book metadata editing are all in; packaging (Flatpak) and a Steam Deck-specific pass are the remaining stretch work. It needs `gst-plugins-good` installed at runtime for voice-note playback (`GtkMediaFile` is GStreamer-backed, and the `autoaudiosink` element it needs to reach real audio output lives in that package, not in `gst-plugins-base`). Most desktop systems already have it as a transitive dependency of a browser or video player; a minimal install may not. On Arch: `sudo pacman -S gst-plugins-good`.
 
 ```sh
 cd gtk-reader
