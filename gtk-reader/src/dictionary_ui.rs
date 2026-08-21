@@ -113,7 +113,7 @@ fn build_lookup_popover(
             let (before, after) = context_around(&buffer_c, word_start, word_end);
             if let Ok(dir) = persistence::config_dir() {
                 let _ = persistence::add_vocab_entry(&dir, &word_owned, &definition, &before, &after, &state_c.title);
-                vocab_ui::refresh_vocab_list(&state_c);
+                vocab_ui::refresh_vocab_list(&state_c.vocab);
             }
             btn.set_label("Added \u{2713}");
             btn.set_sensitive(false);

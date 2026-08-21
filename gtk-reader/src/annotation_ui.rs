@@ -101,19 +101,18 @@ pub struct AnnotationState {
     // (dictionary_ui.rs's "Add to Vocab" button) to label a saved word with
     // which book it came from.
     pub(crate) title: String,
-    // Mirrors `list_container` above, but for `vocab_ui.rs`'s panel — a
-    // separate module, so this field (and `refresh_vocab_list`'s use of it)
-    // needs crate visibility rather than staying private like the
-    // annotations list's own container.
-    pub(crate) vocab_list_container: RefCell<Option<GtkBox>>,
     // Current text of the annotations panel's search box, lowercased.
     // Stored on `AnnotationState` (rather than threaded through every
     // `refresh_annotation_list` caller) so create/edit/delete refreshes keep
     // whatever filter the reader currently has active instead of clearing it.
     list_filter: RefCell<String>,
-    // Same idea as `list_filter`, for `vocab_ui.rs`'s search box -- crate
-    // visibility for the same reason `vocab_list_container` needs it.
-    pub(crate) vocab_list_filter: RefCell<String>,
+    // The reader sidebar's vocab list container + search filter -- lives in
+    // its own handle (see `vocab_ui::VocabListHandle`'s doc comment) so the
+    // same list-rendering code also serves the library page's standalone
+    // vocab window, which has no `AnnotationState` at all. Crate-visible
+    // since `dictionary_ui.rs`'s "Add to Vocab" button needs to trigger a
+    // refresh through it.
+    pub(crate) vocab: Rc<crate::vocab_ui::VocabListHandle>,
 }
 
 impl AnnotationState {
@@ -138,9 +137,8 @@ impl AnnotationState {
             now_playing: RefCell::new(None),
             current_popover: RefCell::new(None),
             title,
-            vocab_list_container: RefCell::new(None),
             list_filter: RefCell::new(String::new()),
-            vocab_list_filter: RefCell::new(String::new()),
+            vocab: crate::vocab_ui::VocabListHandle::new(),
         })
     }
 

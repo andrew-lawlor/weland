@@ -19,10 +19,10 @@ use gtk4::{
     FlowBox, Label, Orientation, Picture, PolicyType, ProgressBar, ScrolledWindow, SearchEntry, SelectionMode,
     StringList, StringObject, ToggleButton,
 };
-use libadwaita::ApplicationWindow;
+use libadwaita::{self as adw, prelude::*, ApplicationWindow};
 use rusqlite::{Connection, OpenFlags};
 
-use crate::{persistence, persistence::LibraryEntry};
+use crate::{document, persistence, persistence::LibraryEntry, settings_ui, vocab_ui};
 
 const COVER_WIDTH: i32 = 110;
 const COVER_HEIGHT: i32 = 160;
@@ -343,6 +343,41 @@ pub fn build_library_page(window: &ApplicationWindow, on_open: Rc<dyn Fn(&str)>)
     import_row.append(&import_book_btn);
     import_row.append(&import_folder_btn);
 
+    // A headless buffer/tags/base-font, never attached to a visible
+    // TextView -- `settings_ui::build_settings_dialog` needs *a* `TextTag`/
+    // `Tags` to apply changes onto (that's how it live-previews inside an
+    // open book), but the library page has no book open. Reusing it here
+    // just gives the dialog somewhere harmless to write, so every change
+    // still goes through the same real `persistence::write_settings`
+    // read-modify-write path and takes effect the next time a book opens --
+    // there's just no live preview to show from this page.
+    let scratch_buffer = gtk4::TextBuffer::new(None);
+    let scratch_tags = Rc::new(document::build_tags(&scratch_buffer));
+    let scratch_base_font = settings_ui::install_base_font_tag(&scratch_buffer);
+
+    let vocab_toggle_content = adw::ButtonContent::builder().icon_name("accessories-dictionary-symbolic").label("Vocab").build();
+    let vocab_btn = Button::builder().child(&vocab_toggle_content).build();
+    let settings_toggle_content = adw::ButtonContent::builder().icon_name("preferences-system-symbolic").label("Settings").build();
+    let settings_btn = Button::builder().child(&settings_toggle_content).build();
+    let utility_row = GtkBox::new(Orientation::Horizontal, 0);
+    utility_row.add_css_class("linked");
+    utility_row.append(&vocab_btn);
+    utility_row.append(&settings_btn);
+
+    {
+        let window = window.clone();
+        vocab_btn.connect_clicked(move |_| {
+            vocab_ui::build_vocab_window(&window);
+        });
+    }
+    {
+        let settings_btn_c = settings_btn.clone();
+        settings_btn.connect_clicked(move |_| {
+            let dialog = settings_ui::build_settings_dialog(scratch_base_font.clone(), scratch_tags.clone());
+            dialog.present(Some(&settings_btn_c));
+        });
+    }
+
     let status_spinner = gtk::Spinner::new();
     status_spinner.set_visible(false);
     let status_label = Label::new(None);
@@ -367,6 +402,7 @@ pub fn build_library_page(window: &ApplicationWindow, on_open: Rc<dyn Fn(&str)>)
     toolbar.append(&status_spinner);
     toolbar.append(&status_label);
     toolbar.append(&import_row);
+    toolbar.append(&utility_row);
 
     let sort_labels: Vec<&str> = SortMode::ALL.iter().map(|s| s.label()).collect();
     let sort_dropdown = DropDown::from_strings(&sort_labels);

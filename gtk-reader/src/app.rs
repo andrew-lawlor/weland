@@ -84,7 +84,7 @@ pub fn build_reader_page(path: &str, on_back: Rc<dyn Fn()>) -> Result<(Paned, St
     // connection rather than sharing the read-write one AnnotationState owns.
     let search_conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).with_context(|| format!("failed to open {path}"))?;
     let search_sidebar = search_ui::build_search_panel(search_conn, annotation_state.clone());
-    let vocab_sidebar = vocab_ui::build_vocab_panel(&annotation_state);
+    let vocab_sidebar = vocab_ui::build_vocab_panel(&annotation_state.vocab);
 
     let sidebar_stack = gtk::Stack::new();
     // The stack is now nested inside a plain vertical Box (for the toggle
