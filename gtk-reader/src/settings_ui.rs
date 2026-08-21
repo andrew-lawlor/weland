@@ -92,7 +92,15 @@ pub fn apply_settings(base_font: &TextTag, tags: &Tags, settings: &Settings) {
 /// `persistence::write_settings` (read-modify-write) and immediately
 /// re-applies to `base_font`/`tags` — no explicit "Save" step. Call
 /// `.present(Some(parent))` on the result to show it.
-pub fn build_settings_dialog(base_font: TextTag, tags: Rc<Tags>) -> adw::PreferencesDialog {
+///
+/// `sharing_hook`, when present, adds a "Sharing" page (LAN sharing on/off +
+/// device name) and is called with the new on/off state every time the
+/// switch changes, so the caller can start/stop its `sharing::ShareService`
+/// live. Only the library page passes one -- sharing is a library-level
+/// concept with nowhere to live from the reader page's settings dialog, so
+/// that call site passes `None` and gets the Reading/Shortcuts pages only,
+/// same as before this existed.
+pub fn build_settings_dialog(base_font: TextTag, tags: Rc<Tags>, sharing_hook: Option<Rc<dyn Fn(bool)>>) -> adw::PreferencesDialog {
     let config_dir = persistence::config_dir().ok();
     let settings = Rc::new(RefCell::new(config_dir.as_ref().map(|d| persistence::read_settings(d)).unwrap_or_default()));
 
@@ -196,9 +204,66 @@ pub fn build_settings_dialog(base_font: TextTag, tags: Rc<Tags>) -> adw::Prefere
 
     dialog.add(&reading_page);
     dialog.add(&build_shortcuts_page(&dialog, &config_dir));
+    if let Some(on_toggle) = sharing_hook {
+        dialog.add(&build_sharing_page(&settings, &config_dir, on_toggle));
+    }
 
     apply_settings(&base_font, &tags, &settings.borrow());
     dialog
+}
+
+/// "Sharing" page: LAN sharing on/off (persisted like every other setting,
+/// plus `on_toggle` so the library page can start/stop the live
+/// `sharing::ShareService`) and an editable device name shown to peers,
+/// falling back to the OS hostname when unset (see `library.rs`'s call into
+/// `sharing::ShareService::start`).
+fn build_sharing_page(settings: &Rc<RefCell<Settings>>, config_dir: &Option<PathBuf>, on_toggle: Rc<dyn Fn(bool)>) -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Sharing");
+    page.set_icon_name(Some("network-wireless-symbolic"));
+
+    let group = adw::PreferencesGroup::new();
+    group.set_title("LAN Book Sharing");
+    group.set_description(Some(
+        "Find other weland devices on this network and offer books you've marked \u{201c}Shared\u{201d} in your library. \
+         Anyone who can find this device on the LAN can pull a shared book while this is on.",
+    ));
+
+    let enabled_row = adw::SwitchRow::new();
+    enabled_row.set_title("Enable LAN sharing");
+    enabled_row.set_active(settings.borrow().lan_sharing_enabled.unwrap_or(false));
+    {
+        let settings_c = settings.clone();
+        let config_dir_c = config_dir.clone();
+        enabled_row.connect_active_notify(move |row| {
+            let enabled = row.is_active();
+            settings_c.borrow_mut().lan_sharing_enabled = Some(enabled);
+            if let Some(dir) = &config_dir_c {
+                let _ = persistence::write_settings(dir, &settings_c.borrow());
+            }
+            on_toggle(enabled);
+        });
+    }
+    group.add(&enabled_row);
+
+    let name_row = adw::EntryRow::new();
+    name_row.set_title("Device name shown to peers");
+    name_row.set_text(settings.borrow().device_name.as_deref().unwrap_or(""));
+    {
+        let settings_c = settings.clone();
+        let config_dir_c = config_dir.clone();
+        name_row.connect_changed(move |row| {
+            let text = row.text().to_string();
+            settings_c.borrow_mut().device_name = if text.trim().is_empty() { None } else { Some(text) };
+            if let Some(dir) = &config_dir_c {
+                let _ = persistence::write_settings(dir, &settings_c.borrow());
+            }
+        });
+    }
+    group.add(&name_row);
+
+    page.add(&group);
+    page
 }
 
 /// Builds the "Shortcuts" page: one `AdwActionRow` per `keybindings::Action`,

@@ -77,6 +77,19 @@ pub fn compile_epub<P: AsRef<Path>, Q: AsRef<Path>>(
     let clean_title = sanitize_metadata_text(&epub.metadata.title);
     let clean_author = sanitize_metadata_text(&epub.metadata.author);
 
+    // Whole-source-file identity, used by the reader app to recognize "the
+    // same book" across machines (LAN sharing) without relying on a
+    // filesystem path. Hashes the raw EPUB bytes rather than anything
+    // derived during compilation, so it stays comparable even if enrichment
+    // logic changes between weland versions.
+    let source_epub_sha256 = {
+        let epub_bytes = fs::read(in_path)
+            .with_context(|| format!("Failed to read EPUB file for hashing: {}", in_path.display()))?;
+        let mut hasher = Sha256::new();
+        hasher.update(&epub_bytes);
+        hex::encode(hasher.finalize())
+    };
+
     // Prepare metadata insertions
     {
         let mut stmt_meta = conn.prepare_cached(
@@ -84,6 +97,7 @@ pub fn compile_epub<P: AsRef<Path>, Q: AsRef<Path>>(
         )?;
 
         stmt_meta.execute(params!["title", &clean_title])?;
+        stmt_meta.execute(params!["source_epub_sha256", &source_epub_sha256])?;
         stmt_meta.execute(params!["author", &clean_author])?;
         stmt_meta.execute(params!["language", &epub.metadata.language])?;
 

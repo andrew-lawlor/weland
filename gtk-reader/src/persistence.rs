@@ -36,6 +36,14 @@ pub struct Settings {
     // `keybindings::Action::default_binding()` at load time.
     #[serde(default)]
     pub keybindings: Option<HashMap<String, KeyBinding>>,
+    // LAN book sharing (see `sharing.rs`) -- off by default, and a device
+    // name shown to peers instead of a bare hostname. Neither field starts
+    // (or is exposed by) anything on its own; `sharing::ShareService` reads
+    // them once at app startup / on toggle.
+    #[serde(default)]
+    pub lan_sharing_enabled: Option<bool>,
+    #[serde(default)]
+    pub device_name: Option<String>,
 }
 
 /// One saved keyboard shortcut: a GDK keyval plus the "meaningful" modifier
@@ -85,6 +93,18 @@ pub struct LibraryEntry {
     // recompiled) backfills it.
     #[serde(default)]
     pub language: Option<String>,
+    // SHA-256 of the source EPUB's raw bytes, from the compiled .wld's own
+    // `source_epub_sha256` metadata key (see `compiler.rs`) -- `None` for
+    // anything imported before this field existed, same backfill-on-next-
+    // open story as `language`. Used by LAN sharing to recognize "the same
+    // book" a peer already has without relying on a filesystem path.
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    // Whether this book is offered to LAN peers via `GET /books` when
+    // sharing is enabled. Per-book opt-in, not a whole-library switch --
+    // defaults to not-shared for every existing and newly imported book.
+    #[serde(default)]
+    pub shared: Option<bool>,
 }
 
 fn library_path(config_dir: &Path) -> PathBuf {
@@ -111,13 +131,24 @@ fn now_epoch_secs() -> i64 {
         .unwrap_or(0)
 }
 
-pub fn upsert_library_entry(config_dir: &Path, path: &str, title: &str, author: Option<&str>, language: Option<&str>) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_library_entry(
+    config_dir: &Path,
+    path: &str,
+    title: &str,
+    author: Option<&str>,
+    language: Option<&str>,
+    content_hash: Option<&str>,
+) -> Result<()> {
     let mut entries = read_library(config_dir)?;
     let now = now_epoch_secs();
     if let Some(existing) = entries.iter_mut().find(|e| e.path == path) {
         existing.title = title.to_string();
         existing.author = author.map(|s| s.to_string());
         existing.language = language.map(|s| s.to_string());
+        if content_hash.is_some() {
+            existing.content_hash = content_hash.map(|s| s.to_string());
+        }
         existing.last_opened_at = now;
     } else {
         entries.push(LibraryEntry {
@@ -129,9 +160,23 @@ pub fn upsert_library_entry(config_dir: &Path, path: &str, title: &str, author: 
             last_position_node_id: None,
             last_position_percent: None,
             language: language.map(|s| s.to_string()),
+            content_hash: content_hash.map(|s| s.to_string()),
+            shared: None,
         });
     }
     write_library(config_dir, &entries)
+}
+
+/// Marks (or unmarks) one library entry as offered to LAN peers. Separate
+/// from `upsert_library_entry` since it's toggled from a per-card control,
+/// not re-derived from the book's own metadata on every open.
+pub fn set_library_entry_shared(config_dir: &Path, path: &str, shared: bool) -> Result<()> {
+    let mut entries = read_library(config_dir)?;
+    if let Some(existing) = entries.iter_mut().find(|e| e.path == path) {
+        existing.shared = Some(shared);
+        write_library(config_dir, &entries)?;
+    }
+    Ok(())
 }
 
 pub fn update_reading_position(config_dir: &Path, path: &str, node_id: i64, percent: f64) -> Result<()> {
@@ -250,8 +295,22 @@ pub fn sandboxed_wld_output_path(books_dir: &Path, input: &Path) -> Result<PathB
     Ok(books_dir.join(format!("{sanitized}-{hash:016x}.wld")))
 }
 
-/// Resolves (and creates) this app's config directory, e.g.
-/// `~/.config/weland-gtk-reader` on Linux.
+/// Deterministic path for a book received over LAN sharing (see
+/// `sharing.rs`) -- keyed by the sender's content hash rather than a source
+/// path (there is no local source EPUB on the receiving side), same
+/// sanitization approach as `sandboxed_wld_output_path`.
+pub fn received_wld_output_path(books_dir: &Path, content_hash: &str, title: &str) -> PathBuf {
+    let sanitized: String = title.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    let sanitized = if sanitized.is_empty() { "book".to_string() } else { sanitized };
+    let short_hash = &content_hash[..content_hash.len().min(16)];
+    books_dir.join(format!("{sanitized}-{short_hash}.wld"))
+}
+
+/// Resolves (and creates) this app's config directory -- `~/.config/gtk-reader`
+/// on Linux (the `directories` crate's Linux/XDG backend uses only the
+/// `application` component of `ProjectDirs::from`, not the qualifier/org
+/// prefix other platforms use; confirmed live, not just by this crate's
+/// argument order).
 pub fn config_dir() -> Result<PathBuf> {
     let dirs = directories::ProjectDirs::from("dev", "weland", "gtk-reader")
         .context("Failed to resolve config directory")?;
@@ -260,9 +319,9 @@ pub fn config_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Resolves (and creates) this app's data directory, e.g.
-/// `~/.local/share/weland-gtk-reader` on Linux — where compiled `.wld` books
-/// live, separate from the small JSON config files.
+/// Resolves (and creates) this app's data directory -- `~/.local/share/gtk-reader`
+/// on Linux, same qualifier/org caveat as `config_dir` above — where compiled
+/// `.wld` books live, separate from the small JSON config files.
 pub fn data_dir() -> Result<PathBuf> {
     let dirs = directories::ProjectDirs::from("dev", "weland", "gtk-reader")
         .context("Failed to resolve data directory")?;
@@ -304,14 +363,15 @@ mod tests {
     fn library_upsert_adds_then_updates_in_place() {
         let dir = tempdir().unwrap();
 
-        upsert_library_entry(dir.path(), "/books/odyssey.wld", "The Odyssey", Some("Homer"), Some("en")).unwrap();
+        upsert_library_entry(dir.path(), "/books/odyssey.wld", "The Odyssey", Some("Homer"), Some("en"), Some("abc123")).unwrap();
         let entries = read_library(dir.path()).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].title, "The Odyssey");
         assert_eq!(entries[0].last_position_node_id, None);
+        assert_eq!(entries[0].content_hash.as_deref(), Some("abc123"));
 
         update_reading_position(dir.path(), "/books/odyssey.wld", 42, 0.5).unwrap();
-        upsert_library_entry(dir.path(), "/books/odyssey.wld", "The Odyssey (2nd ed.)", Some("Homer"), Some("en")).unwrap();
+        upsert_library_entry(dir.path(), "/books/odyssey.wld", "The Odyssey (2nd ed.)", Some("Homer"), Some("en"), None).unwrap();
 
         let entries = read_library(dir.path()).unwrap();
         assert_eq!(entries.len(), 1, "re-adding the same path must not duplicate the entry");
@@ -320,15 +380,31 @@ mod tests {
         // in between — same read-modify-write discipline as settings.
         assert_eq!(entries[0].last_position_node_id, Some(42));
         assert_eq!(entries[0].last_position_percent, Some(0.5));
+        // A later upsert with no content_hash (e.g. a book pre-dating this
+        // field, or app.rs's own re-open path when metadata lacks it) must
+        // not clobber a hash already captured.
+        assert_eq!(entries[0].content_hash.as_deref(), Some("abc123"));
     }
 
     #[test]
     fn update_reading_position_clamps_percent() {
         let dir = tempdir().unwrap();
-        upsert_library_entry(dir.path(), "/books/x.wld", "X", None, None).unwrap();
+        upsert_library_entry(dir.path(), "/books/x.wld", "X", None, None, None).unwrap();
         update_reading_position(dir.path(), "/books/x.wld", 1, 1.5).unwrap();
         let entries = read_library(dir.path()).unwrap();
         assert_eq!(entries[0].last_position_percent, Some(1.0));
+    }
+
+    #[test]
+    fn set_library_entry_shared_toggles_only_that_entry() {
+        let dir = tempdir().unwrap();
+        upsert_library_entry(dir.path(), "/books/a.wld", "A", None, None, None).unwrap();
+        upsert_library_entry(dir.path(), "/books/b.wld", "B", None, None, None).unwrap();
+
+        set_library_entry_shared(dir.path(), "/books/a.wld", true).unwrap();
+        let entries = read_library(dir.path()).unwrap();
+        assert_eq!(entries.iter().find(|e| e.path == "/books/a.wld").unwrap().shared, Some(true));
+        assert_eq!(entries.iter().find(|e| e.path == "/books/b.wld").unwrap().shared, None);
     }
 
     #[test]
@@ -348,6 +424,20 @@ mod tests {
 
         assert_eq!(out_a1, out_a2, "the same source path must hash to the same output every time");
         assert_ne!(out_a1, out_b, "different source paths must not collide");
+    }
+
+    #[test]
+    fn received_wld_path_is_stable_and_sanitizes_title() {
+        let dir = tempdir().unwrap();
+        let books_dir = dir.path().join("books");
+
+        let a = received_wld_output_path(&books_dir, "abc123", "The Odyssey");
+        let b = received_wld_output_path(&books_dir, "abc123", "The Odyssey");
+        assert_eq!(a, b, "same hash + title must resolve to the same path");
+        assert!(a.to_string_lossy().contains("The_Odyssey"));
+
+        let different_hash = received_wld_output_path(&books_dir, "def456", "The Odyssey");
+        assert_ne!(a, different_hash, "different content hashes must not collide");
     }
 
     #[test]

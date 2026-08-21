@@ -8,6 +8,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -17,12 +18,12 @@ use anyhow::Result;
 use gtk4::{
     self as gtk, gdk_pixbuf, gio, glib, prelude::*, Align, Box as GtkBox, Button, DropDown, FileDialog, FileFilter,
     FlowBox, Label, Orientation, Picture, PolicyType, ProgressBar, ScrolledWindow, SearchEntry, SelectionMode,
-    StringList, StringObject, ToggleButton,
+    Separator, StringList, StringObject, ToggleButton,
 };
 use libadwaita::{self as adw, prelude::*, ApplicationWindow};
 use rusqlite::{Connection, OpenFlags};
 
-use crate::{document, persistence, persistence::LibraryEntry, settings_ui, vocab_ui};
+use crate::{document, persistence, persistence::LibraryEntry, settings_ui, sharing, vocab_ui};
 
 const COVER_WIDTH: i32 = 110;
 const COVER_HEIGHT: i32 = 160;
@@ -355,13 +356,33 @@ pub fn build_library_page(window: &ApplicationWindow, on_open: Rc<dyn Fn(&str)>)
     let scratch_tags = Rc::new(document::build_tags(&scratch_buffer));
     let scratch_base_font = settings_ui::install_base_font_tag(&scratch_buffer);
 
+    // LAN sharing (see `sharing.rs`) is started once here, at startup, if
+    // the user already had it on -- and can be started/stopped later from
+    // the Settings dialog's toggle (`on_toggle` below), which is the only
+    // other place that ever writes to this cell. `Option` (not just the
+    // service itself) is the point: "off" is a real, cheap, common state.
+    let share_service: Rc<RefCell<Option<Rc<sharing::ShareService>>>> = Rc::new(RefCell::new(None));
+    {
+        let startup_settings = persistence::read_settings(&config_dir);
+        if startup_settings.lan_sharing_enabled.unwrap_or(false) {
+            let device_name = startup_settings.device_name.unwrap_or_else(sharing_device_name);
+            match sharing::ShareService::start((*config_dir).clone(), device_name) {
+                Ok(service) => *share_service.borrow_mut() = Some(service),
+                Err(e) => eprintln!("[sharing] failed to start: {e}"),
+            }
+        }
+    }
+
     let vocab_toggle_content = adw::ButtonContent::builder().icon_name("accessories-dictionary-symbolic").label("Vocab").build();
     let vocab_btn = Button::builder().child(&vocab_toggle_content).build();
+    let share_toggle_content = adw::ButtonContent::builder().icon_name("network-wireless-symbolic").label("Share").build();
+    let share_btn = Button::builder().child(&share_toggle_content).build();
     let settings_toggle_content = adw::ButtonContent::builder().icon_name("preferences-system-symbolic").label("Settings").build();
     let settings_btn = Button::builder().child(&settings_toggle_content).build();
     let utility_row = GtkBox::new(Orientation::Horizontal, 0);
     utility_row.add_css_class("linked");
     utility_row.append(&vocab_btn);
+    utility_row.append(&share_btn);
     utility_row.append(&settings_btn);
 
     {
@@ -372,8 +393,26 @@ pub fn build_library_page(window: &ApplicationWindow, on_open: Rc<dyn Fn(&str)>)
     }
     {
         let settings_btn_c = settings_btn.clone();
+        let share_service = share_service.clone();
+        let config_dir = config_dir.clone();
         settings_btn.connect_clicked(move |_| {
-            let dialog = settings_ui::build_settings_dialog(scratch_base_font.clone(), scratch_tags.clone());
+            let share_service = share_service.clone();
+            let config_dir = config_dir.clone();
+            let on_toggle: Rc<dyn Fn(bool)> = Rc::new(move |enabled| {
+                if enabled {
+                    if share_service.borrow().is_none() {
+                        let settings = persistence::read_settings(&config_dir);
+                        let device_name = settings.device_name.unwrap_or_else(sharing_device_name);
+                        match sharing::ShareService::start((*config_dir).clone(), device_name) {
+                            Ok(service) => *share_service.borrow_mut() = Some(service),
+                            Err(e) => eprintln!("[sharing] failed to start: {e}"),
+                        }
+                    }
+                } else if let Some(service) = share_service.borrow_mut().take() {
+                    service.stop();
+                }
+            });
+            let dialog = settings_ui::build_settings_dialog(scratch_base_font.clone(), scratch_tags.clone(), Some(on_toggle));
             dialog.present(Some(&settings_btn_c));
         });
     }
@@ -549,6 +588,42 @@ pub fn build_library_page(window: &ApplicationWindow, on_open: Rc<dyn Fn(&str)>)
     refresh_ui();
     spawn_language_backfill(config_dir.clone(), entries.clone(), refresh_ui.clone());
 
+    // `refresh_ui` only re-renders the flowbox from whatever's *already* in
+    // the in-memory `entries` -- it never reloads `library.json`. Every
+    // local-import completion handler below re-reads the file into
+    // `entries` itself before calling `refresh_ui()` for exactly that
+    // reason. A peer import (`sharing::import_from_peer`) writes straight to
+    // `library.json` from a background thread with no access to this page's
+    // in-memory `entries` at all, so it needs the same disk-reload step --
+    // `refresh` (also returned at the bottom of this function, for
+    // `main.rs`'s return-to-library refresh) does that reload-then-render
+    // sequence and is what the LAN-sharing dialogs below use instead of the
+    // raw `refresh_ui`. Built here (rather than staying in its original
+    // spot further down) specifically so it exists before that wiring needs
+    // it.
+    let refresh: Rc<dyn Fn()> = {
+        let entries = entries.clone();
+        let config_dir = config_dir.clone();
+        let refresh_ui = refresh_ui.clone();
+        Rc::new(move || {
+            if let Ok(fresh) = persistence::read_library(&config_dir) {
+                *entries.borrow_mut() = fresh;
+            }
+            refresh_ui();
+        })
+    };
+
+    {
+        let window = window.clone();
+        let share_service = share_service.clone();
+        let config_dir = config_dir.clone();
+        let books_dir = books_dir.clone();
+        let refresh = refresh.clone();
+        share_btn.connect_clicked(move |_| {
+            build_nearby_devices_dialog(&window, share_service.clone(), config_dir.clone(), books_dir.clone(), refresh.clone());
+        });
+    }
+
     {
         let filters = filters.clone();
         let refresh_ui = refresh_ui.clone();
@@ -660,18 +735,6 @@ pub fn build_library_page(window: &ApplicationWindow, on_open: Rc<dyn Fn(&str)>)
             });
         });
     }
-
-    let refresh: Rc<dyn Fn()> = {
-        let entries = entries.clone();
-        let config_dir = config_dir.clone();
-        let refresh_ui = refresh_ui.clone();
-        Rc::new(move || {
-            if let Ok(fresh) = persistence::read_library(&config_dir) {
-                *entries.borrow_mut() = fresh;
-            }
-            refresh_ui();
-        })
-    };
 
     Ok((root, refresh))
 }
@@ -865,6 +928,29 @@ fn rebuild_flowbox(
             });
         }
         meta_row.append(&edit_lang_btn);
+
+        let share_toggle = ToggleButton::builder().icon_name("network-wireless-symbolic").build();
+        share_toggle.set_has_frame(false);
+        share_toggle.add_css_class("flat");
+        share_toggle.set_tooltip_text(Some("Offer this book to devices on your LAN when sharing is on"));
+        share_toggle.set_active(entry.shared == Some(true));
+        {
+            let path = entry.path.clone();
+            let config_dir = config_dir.clone();
+            let entries_rc = entries_rc.clone();
+            let refresh_ui_cell = refresh_ui_cell.clone();
+            share_toggle.connect_toggled(move |btn| {
+                let shared = btn.is_active();
+                let _ = persistence::set_library_entry_shared(&config_dir, &path, shared);
+                if let Some(e) = entries_rc.borrow_mut().iter_mut().find(|e| e.path == path) {
+                    e.shared = Some(shared);
+                }
+                if let Some(refresh_ui) = refresh_ui_cell.borrow().clone() {
+                    refresh_ui();
+                }
+            });
+        }
+        meta_row.append(&share_toggle);
         card.append(&meta_row);
 
         if let Some(percent) = entry.last_position_percent {
@@ -1234,6 +1320,7 @@ fn import_one(config_dir: &std::path::Path, books_dir: &std::path::Path, input: 
         &title,
         metadata.get("author").map(|s| s.as_str()),
         metadata.get("language").map(|s| s.as_str()),
+        metadata.get("source_epub_sha256").map(|s| s.as_str()),
     )?;
     Ok(())
 }
@@ -1258,9 +1345,426 @@ fn find_epubs_recursive(root: &std::path::Path) -> Vec<PathBuf> {
     found
 }
 
+fn sharing_device_name() -> String {
+    gethostname::gethostname().to_string_lossy().to_string()
+}
+
+/// "Nearby Devices" dialog: lists LAN peers currently discovered by
+/// `share_service` (re-rendered on a short timer while the dialog is open,
+/// stopped via `dialog.connect_closed` once it isn't -- there's no push
+/// notification from `sharing::ShareService`, and polling a plain `Vec` is
+/// simpler than wiring one up for a list this size). Shows an explanatory
+/// message instead of a peer list when sharing is off.
+fn build_nearby_devices_dialog(
+    parent: &impl IsA<gtk::Widget>,
+    share_service: Rc<RefCell<Option<Rc<sharing::ShareService>>>>,
+    config_dir: Rc<PathBuf>,
+    books_dir: Rc<PathBuf>,
+    refresh: Rc<dyn Fn()>,
+) {
+    let list = GtkBox::new(Orientation::Vertical, 10);
+    list.set_margin_top(8);
+    list.set_margin_bottom(8);
+    list.set_margin_start(8);
+    list.set_margin_end(8);
+
+    let scroller = ScrolledWindow::builder().child(&list).hscrollbar_policy(PolicyType::Never).vexpand(true).build();
+    let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&Label::new(Some("Nearby Devices"))));
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&header);
+    toolbar_view.set_content(Some(&scroller));
+
+    let dialog = adw::Dialog::new();
+    dialog.set_presentation_mode(adw::DialogPresentationMode::Floating);
+    dialog.set_content_width(420);
+    dialog.set_content_height(480);
+    dialog.set_child(Some(&toolbar_view));
+
+    let stop_polling = Rc::new(std::cell::Cell::new(false));
+    {
+        let stop_polling = stop_polling.clone();
+        dialog.connect_closed(move |_| stop_polling.set(true));
+    }
+
+    let render = {
+        let list = list.clone();
+        let share_service = share_service.clone();
+        let config_dir = config_dir.clone();
+        let books_dir = books_dir.clone();
+        let refresh = refresh.clone();
+        let dialog = dialog.clone();
+        move || {
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+
+            let Some(service) = share_service.borrow().clone() else {
+                let msg = Label::new(Some("Enable LAN sharing in Settings to discover nearby devices."));
+                msg.set_wrap(true);
+                msg.set_halign(Align::Start);
+                msg.add_css_class("dim-label");
+                list.append(&msg);
+                return;
+            };
+
+            let peers = service.peers();
+            if peers.is_empty() {
+                let msg = Label::new(Some("Searching for devices\u{2026} make sure LAN sharing is on for them too."));
+                msg.set_wrap(true);
+                msg.set_halign(Align::Start);
+                msg.add_css_class("dim-label");
+                list.append(&msg);
+                return;
+            }
+
+            for peer in peers {
+                let row = GtkBox::new(Orientation::Horizontal, 8);
+                let name_label = Label::new(Some(&peer.name));
+                name_label.set_hexpand(true);
+                name_label.set_halign(Align::Start);
+                row.append(&name_label);
+
+                let books_btn = Button::with_label("Books\u{2026}");
+                {
+                    let config_dir = config_dir.clone();
+                    let books_dir = books_dir.clone();
+                    let refresh = refresh.clone();
+                    let nearby_dialog = dialog.clone();
+                    let addr = peer.addr;
+                    let peer_name = peer.name.clone();
+                    books_btn.connect_clicked(move |_| {
+                        spawn_fetch_peer_books(addr, peer_name.clone(), nearby_dialog.clone(), config_dir.clone(), books_dir.clone(), refresh.clone());
+                    });
+                }
+                row.append(&books_btn);
+                list.append(&row);
+            }
+        }
+    };
+
+    render();
+    glib::timeout_add_local(Duration::from_millis(1500), move || {
+        if stop_polling.get() {
+            return glib::ControlFlow::Break;
+        }
+        render();
+        glib::ControlFlow::Continue
+    });
+
+    dialog.present(Some(parent));
+}
+
+enum FetchBooksMsg {
+    Done(Vec<sharing::SharedBook>),
+    Failed(String),
+}
+
+/// Fetches one peer's shared-book list in the background (blocking network
+/// I/O, same `std::thread::spawn` + `mpsc` + `glib::timeout_add_local`
+/// pattern as every other background op in this file) and opens
+/// `build_peer_books_dialog` once it lands.
+fn spawn_fetch_peer_books(
+    addr: SocketAddr,
+    peer_name: String,
+    nearby_dialog: adw::Dialog,
+    config_dir: Rc<PathBuf>,
+    books_dir: Rc<PathBuf>,
+    refresh: Rc<dyn Fn()>,
+) {
+    let (tx, rx) = mpsc::channel::<FetchBooksMsg>();
+    std::thread::spawn(move || {
+        let _ = tx.send(match sharing::fetch_peer_books(addr) {
+            Ok(books) => FetchBooksMsg::Done(books),
+            Err(e) => FetchBooksMsg::Failed(e.to_string()),
+        });
+    });
+
+    glib::timeout_add_local(Duration::from_millis(150), move || match rx.try_recv() {
+        Ok(FetchBooksMsg::Done(books)) => {
+            build_peer_books_dialog(nearby_dialog.clone(), addr, peer_name.clone(), books, config_dir.clone(), books_dir.clone(), refresh.clone());
+            glib::ControlFlow::Break
+        }
+        Ok(FetchBooksMsg::Failed(err)) => {
+            eprintln!("[sharing] failed to fetch books from {peer_name}: {err}");
+            let alert = adw::AlertDialog::new(Some("Couldn\u{2019}t reach device"), Some(&err));
+            alert.add_response("ok", "OK");
+            alert.present(Some(&nearby_dialog));
+            glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+    });
+}
+
+/// `filter` is already lowercased by the caller (the search box's live text,
+/// once per keystroke) -- kept as a plain function, not inlined into the
+/// dialog's render closure, so it's unit-testable without constructing any
+/// GTK widgets.
+fn peer_book_matches_search(book: &sharing::SharedBook, filter: &str) -> bool {
+    filter.is_empty()
+        || book.title.to_lowercase().contains(filter)
+        || book.author.as_ref().is_some_and(|a| a.to_lowercase().contains(filter))
+}
+
+/// Lists one peer's shared books with an Import button each -- clicking one
+/// always goes through `confirm_and_import`'s accept dialog first, never
+/// imports directly, per the security posture in the plan (no auto-import
+/// on receipt, ever). Takes `nearby_dialog` (not just a generic parent
+/// widget) so a successful import can close both this dialog and it,
+/// dropping the user straight back onto the library grid where the newly
+/// imported book is now visible -- otherwise a completed import has no
+/// visible effect until the user manually closes two dialogs to find it.
+fn build_peer_books_dialog(
+    nearby_dialog: adw::Dialog,
+    addr: SocketAddr,
+    peer_name: String,
+    books: Vec<sharing::SharedBook>,
+    config_dir: Rc<PathBuf>,
+    books_dir: Rc<PathBuf>,
+    refresh: Rc<dyn Fn()>,
+) {
+    // Built before its content -- a per-book "Import" click needs to open an
+    // `AlertDialog` anchored to *this* dialog (the thing actually on top of
+    // the stack when the click happens), not the "Nearby Devices" dialog
+    // still sitting underneath it. Anchoring to a dialog that isn't the
+    // current top of the stack doesn't error, it just never presents --
+    // `AlertDialog::choose()`'s callback then simply never fires, since
+    // nothing the user can see or click ever appeared. That was the bug:
+    // every row here used to capture this function's own `parent` parameter
+    // (the Nearby Devices dialog) instead of this dialog's own widget.
+    let dialog = adw::Dialog::new();
+    dialog.set_presentation_mode(adw::DialogPresentationMode::Floating);
+    dialog.set_content_width(420);
+    dialog.set_content_height(480);
+
+    let books = Rc::new(books);
+    let search_entry = SearchEntry::builder().placeholder_text("Search books\u{2026}").build();
+    search_entry.set_margin_top(8);
+    search_entry.set_margin_start(8);
+    search_entry.set_margin_end(8);
+
+    let list = GtkBox::new(Orientation::Vertical, 10);
+    list.set_margin_top(8);
+    list.set_margin_bottom(8);
+    list.set_margin_start(8);
+    list.set_margin_end(8);
+
+    // Re-run on every keystroke against the one `books` list this dialog was
+    // opened with (a peer's shared list doesn't change while this dialog is
+    // open) -- same live-filter shape as the annotation and vocab panels'
+    // search boxes, just filtering an in-memory `Vec` instead of SQLite/JSON.
+    let render = {
+        let list = list.clone();
+        let books = books.clone();
+        let dialog = dialog.clone();
+        let nearby_dialog = nearby_dialog.clone();
+        let peer_name = peer_name.clone();
+        let config_dir = config_dir.clone();
+        let books_dir = books_dir.clone();
+        let refresh = refresh.clone();
+        let search_entry = search_entry.clone();
+        move || {
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+
+            let filter = search_entry.text().to_lowercase();
+            let matches: Vec<&sharing::SharedBook> = books.iter().filter(|b| peer_book_matches_search(b, &filter)).collect();
+
+            if matches.is_empty() {
+                let msg = Label::new(Some(if books.is_empty() {
+                    "This device isn't sharing any books right now."
+                } else {
+                    "No books match your search."
+                }));
+                msg.set_wrap(true);
+                msg.set_halign(Align::Start);
+                msg.add_css_class("dim-label");
+                list.append(&msg);
+                return;
+            }
+
+            for book in matches {
+                let row = GtkBox::new(Orientation::Vertical, 2);
+                let title_label = Label::new(Some(&book.title));
+                title_label.set_halign(Align::Start);
+                title_label.add_css_class("heading");
+                row.append(&title_label);
+
+                if let Some(author) = &book.author {
+                    let author_label = Label::new(Some(author));
+                    author_label.set_halign(Align::Start);
+                    author_label.add_css_class("dim-label");
+                    row.append(&author_label);
+                }
+
+                let import_btn = Button::with_label(&format!("Import ({:.1} MB)\u{2026}", book.size as f64 / (1024.0 * 1024.0)));
+                import_btn.set_halign(Align::Start);
+                {
+                    let nearby_dialog = nearby_dialog.clone();
+                    let books_dialog = dialog.clone();
+                    let book = book.clone();
+                    let peer_name = peer_name.clone();
+                    let config_dir = config_dir.clone();
+                    let books_dir = books_dir.clone();
+                    let refresh = refresh.clone();
+                    import_btn.connect_clicked(move |_| {
+                        confirm_and_import(
+                            nearby_dialog.clone(),
+                            books_dialog.clone(),
+                            addr,
+                            peer_name.clone(),
+                            book.clone(),
+                            config_dir.clone(),
+                            books_dir.clone(),
+                            refresh.clone(),
+                        );
+                    });
+                }
+                row.append(&import_btn);
+                list.append(&row);
+                list.append(&Separator::new(Orientation::Horizontal));
+            }
+        }
+    };
+
+    render();
+    {
+        let render = render.clone();
+        search_entry.connect_changed(move |_| render());
+    }
+
+    let scroller = ScrolledWindow::builder().child(&list).hscrollbar_policy(PolicyType::Never).vexpand(true).build();
+    let panel = GtkBox::new(Orientation::Vertical, 0);
+    panel.append(&search_entry);
+    panel.append(&scroller);
+
+    let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&Label::new(Some(&format!("Books from {peer_name}")))));
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&header);
+    toolbar_view.set_content(Some(&panel));
+
+    dialog.set_child(Some(&toolbar_view));
+    dialog.present(Some(&nearby_dialog));
+}
+
+/// The one and only path to an import from a peer -- always a named,
+/// sized, explicit confirmation before anything is fetched, let alone
+/// written to disk.
+#[allow(clippy::too_many_arguments)]
+fn confirm_and_import(
+    nearby_dialog: adw::Dialog,
+    books_dialog: adw::Dialog,
+    addr: SocketAddr,
+    peer_name: String,
+    book: sharing::SharedBook,
+    config_dir: Rc<PathBuf>,
+    books_dir: Rc<PathBuf>,
+    refresh: Rc<dyn Fn()>,
+) {
+    let body = format!(
+        "Import \u{201c}{}\u{201d}{} from {peer_name}? ({:.1} MB)",
+        book.title,
+        book.author.as_ref().map(|a| format!(" by {a}")).unwrap_or_default(),
+        book.size as f64 / (1024.0 * 1024.0)
+    );
+    let alert = adw::AlertDialog::new(Some("Import book?"), Some(&body));
+    alert.add_response("cancel", "Cancel");
+    alert.add_response("import", "Import");
+    alert.set_response_appearance("import", adw::ResponseAppearance::Suggested);
+    alert.set_default_response(Some("import"));
+    alert.set_close_response("cancel");
+
+    let alert_parent = books_dialog.clone();
+    alert.choose(Some(&alert_parent), gio::Cancellable::NONE, move |response| {
+        if response.as_str() == "import" {
+            spawn_import_from_peer(addr, book.clone(), config_dir.clone(), books_dir.clone(), refresh.clone(), nearby_dialog.clone(), books_dialog.clone());
+        }
+    });
+}
+
+enum ImportPeerMsg {
+    Done,
+    Failed(String),
+}
+
+/// Fetch-validate-and-register in the background -- `sharing::import_from_peer`
+/// does the actual work (including rejecting a malformed/mismatched
+/// transfer); this just marshals its result back to the UI. On success both
+/// dialogs close so the underlying (now-refreshed) library grid is
+/// immediately visible with the new book in it -- that's the only positive
+/// confirmation this gives, deliberately, rather than adding a separate
+/// toast/status mechanism just for this one flow. On failure both dialogs
+/// stay open and an `AlertDialog` states what went wrong, anchored to
+/// `books_dialog` so the user can see it and try a different book.
+#[allow(clippy::too_many_arguments)]
+fn spawn_import_from_peer(
+    addr: SocketAddr,
+    book: sharing::SharedBook,
+    config_dir: Rc<PathBuf>,
+    books_dir: Rc<PathBuf>,
+    refresh: Rc<dyn Fn()>,
+    nearby_dialog: adw::Dialog,
+    books_dialog: adw::Dialog,
+) {
+    let (tx, rx) = mpsc::channel::<ImportPeerMsg>();
+    let config_dir_owned = (*config_dir).clone();
+    let books_dir_owned = (*books_dir).clone();
+    std::thread::spawn(move || {
+        let result = sharing::import_from_peer(&config_dir_owned, &books_dir_owned, addr, &book);
+        let _ = tx.send(match result {
+            Ok(()) => ImportPeerMsg::Done,
+            Err(e) => ImportPeerMsg::Failed(e.to_string()),
+        });
+    });
+
+    glib::timeout_add_local(Duration::from_millis(150), move || match rx.try_recv() {
+        Ok(ImportPeerMsg::Done) => {
+            refresh();
+            books_dialog.close();
+            nearby_dialog.close();
+            glib::ControlFlow::Break
+        }
+        Ok(ImportPeerMsg::Failed(err)) => {
+            eprintln!("[sharing] import failed: {err}");
+            let alert = adw::AlertDialog::new(Some("Import failed"), Some(&err));
+            alert.add_response("ok", "OK");
+            alert.present(Some(&books_dialog));
+            glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shared_book(title: &str, author: Option<&str>) -> sharing::SharedBook {
+        sharing::SharedBook { title: title.to_string(), author: author.map(String::from), content_hash: "hash".to_string(), size: 0 }
+    }
+
+    #[test]
+    fn peer_book_search_matches_title_and_author_case_insensitively() {
+        let book = shared_book("The Divine Comedy", Some("Dante Alighieri"));
+
+        assert!(peer_book_matches_search(&book, ""), "an empty filter must match everything");
+        assert!(peer_book_matches_search(&book, "divine"), "must match a substring of the title");
+        assert!(peer_book_matches_search(&book, &"DANTE".to_lowercase()), "must match case-insensitively");
+        assert!(peer_book_matches_search(&book, "alighieri"), "must match a substring of the author");
+        assert!(!peer_book_matches_search(&book, "beowulf"), "must not match unrelated text");
+    }
+
+    #[test]
+    fn peer_book_search_handles_missing_author() {
+        let book = shared_book("Fresh Test Book", None);
+        assert!(peer_book_matches_search(&book, ""));
+        assert!(peer_book_matches_search(&book, "fresh"));
+        assert!(!peer_book_matches_search(&book, "anyone"), "no author to match against must not panic or false-match");
+    }
 
     fn entry(title: &str, author: Option<&str>, language: Option<&str>, added_at: i64, last_opened_at: i64, percent: Option<f64>) -> LibraryEntry {
         LibraryEntry {
@@ -1272,6 +1776,8 @@ mod tests {
             last_position_node_id: percent.map(|_| 1),
             last_position_percent: percent,
             language: language.map(String::from),
+            content_hash: None,
+            shared: None,
         }
     }
 

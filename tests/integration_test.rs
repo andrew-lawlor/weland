@@ -76,6 +76,7 @@ fn test_end_to_end_epub_compilation() {
     assert_eq!(meta_rows.get("author").unwrap(), "Jane Doe");
     assert_eq!(meta_rows.get("language").unwrap(), "en");
     assert!(meta_rows.contains_key("cover_asset_id"));
+    assert_eq!(meta_rows.get("source_epub_sha256").unwrap().len(), 64, "source_epub_sha256 must be a hex-encoded SHA-256 digest");
 
     // 2. Verify AST Nodes
     let mut stmt = conn
@@ -166,6 +167,53 @@ fn test_end_to_end_epub_compilation() {
     let md_content = std::fs::read_to_string(&md_out).unwrap();
     assert!(md_content.contains("# The Principles of Weland"));
     assert!(md_content.contains("*by Jane Doe*"));
+}
+
+// LAN sharing (gtk-reader) identifies "the same book" across two machines by
+// comparing this hash, so it must depend only on the source EPUB's bytes --
+// never on wall-clock time or anything else that could differ between two
+// otherwise-identical compiles.
+#[test]
+fn test_source_epub_hash_is_deterministic_and_content_addressed() {
+    let temp_dir = TempDir::new().unwrap();
+    let epub_path = temp_dir.path().join("test_book.epub");
+    create_test_epub(&epub_path);
+
+    let options = CompileOptions { quiet: true, verbose: false };
+
+    let wld_a = temp_dir.path().join("a.wld");
+    compile_epub(&epub_path, &wld_a, &options).expect("Compilation A failed");
+    let hash_a: String = Connection::open(&wld_a)
+        .unwrap()
+        .query_row("SELECT value FROM metadata WHERE key = 'source_epub_sha256'", [], |r| r.get(0))
+        .unwrap();
+
+    let wld_b = temp_dir.path().join("b.wld");
+    compile_epub(&epub_path, &wld_b, &options).expect("Compilation B failed");
+    let hash_b: String = Connection::open(&wld_b)
+        .unwrap()
+        .query_row("SELECT value FROM metadata WHERE key = 'source_epub_sha256'", [], |r| r.get(0))
+        .unwrap();
+
+    assert_eq!(hash_a, hash_b, "compiling the same EPUB twice must produce the same source hash");
+
+    // A different source EPUB must hash differently.
+    let other_epub_path = temp_dir.path().join("other_book.epub");
+    create_test_epub(&other_epub_path);
+    std::fs::write(&other_epub_path, {
+        let mut bytes = std::fs::read(&other_epub_path).unwrap();
+        bytes.push(0); // perturb the bytes so it's not byte-identical to test_book.epub
+        bytes
+    })
+    .unwrap();
+    let wld_c = temp_dir.path().join("c.wld");
+    compile_epub(&other_epub_path, &wld_c, &options).expect("Compilation C failed");
+    let hash_c: String = Connection::open(&wld_c)
+        .unwrap()
+        .query_row("SELECT value FROM metadata WHERE key = 'source_epub_sha256'", [], |r| r.get(0))
+        .unwrap();
+
+    assert_ne!(hash_a, hash_c, "different source EPUB bytes must hash differently");
 }
 
 #[test]

@@ -20,6 +20,7 @@ mod persistence;
 mod recording;
 mod search_ui;
 mod settings_ui;
+mod sharing;
 mod toc;
 mod vocab_ui;
 
@@ -119,7 +120,13 @@ fn main() -> Result<()> {
     // "Library" button.
     let path = env::args().nth(1);
     adw::init().expect("libadwaita init");
-    let gtk_app = adw::Application::builder().application_id(APP_ID).build();
+    // GApplication's D-Bus single-instance activation is keyed on this id --
+    // a second launch under the same one doesn't start a new process, it
+    // just activates the first and exits. `WELAND_APP_ID` lets manual LAN-
+    // sharing testing (two profiles, same binary, same session bus) run
+    // truly separate instances; unset, behavior is unchanged.
+    let app_id = env::var("WELAND_APP_ID").unwrap_or_else(|_| APP_ID.to_string());
+    let gtk_app = adw::Application::builder().application_id(app_id).build();
     gtk_app.connect_activate(move |gtk_app| {
         if let Err(e) = fonts::load_reading_fonts() {
             eprintln!("failed to load reading fonts: {e}");
