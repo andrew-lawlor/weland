@@ -100,15 +100,23 @@ pub fn build_reader_page(path: &str, on_back: Rc<dyn Fn()>) -> Result<(Paned, St
     sidebar_stack.add_named(&search_sidebar, Some("search"));
     sidebar_stack.add_named(&vocab_sidebar, Some("vocab"));
 
-    let toc_toggle = gtk::Button::with_label("Contents");
-    let annotations_toggle = gtk::Button::with_label("Annotations");
-    let search_toggle = gtk::Button::with_label("Search");
-    let vocab_toggle = gtk::Button::with_label("Vocab");
-    // Icon+label, not a plain text button like its siblings -- "Aa" (a
-    // typography-only convention borrowed from e-reader apps) undersold this
-    // once it grew to cover keyboard shortcuts too, not just font settings.
-    let settings_toggle_content = libadwaita::ButtonContent::builder().icon_name("preferences-system-symbolic").label("Settings").build();
-    let settings_toggle = gtk::Button::builder().child(&settings_toggle_content).build();
+    // Icon-only + tooltip, not text labels -- five text buttons ("Contents"
+    // / "Annotations" / "Search" / "Vocab" / "Settings") is exactly the same
+    // toolbar-width problem the library page's utility row had, just worse
+    // here since the sidebar itself is only ~220px wide to begin with.
+    // Reuses the same icon names as their library-page counterparts
+    // (`library.rs`'s Vocab/Settings buttons) where the same concept
+    // applies, for one consistent icon vocabulary across the app.
+    let toc_toggle = gtk::Button::from_icon_name("view-list-symbolic");
+    toc_toggle.set_tooltip_text(Some("Contents"));
+    let annotations_toggle = gtk::Button::from_icon_name("edit-symbolic");
+    annotations_toggle.set_tooltip_text(Some("Annotations"));
+    let search_toggle = gtk::Button::from_icon_name("edit-find-symbolic");
+    search_toggle.set_tooltip_text(Some("Search"));
+    let vocab_toggle = gtk::Button::from_icon_name("accessories-dictionary-symbolic");
+    vocab_toggle.set_tooltip_text(Some("Vocabulary"));
+    let settings_toggle = gtk::Button::from_icon_name("preferences-system-symbolic");
+    settings_toggle.set_tooltip_text(Some("Settings"));
     toc_toggle.add_css_class("suggested-action");
 
     // `.linked` (a GNOME HIG / Adwaita convention) draws these as one

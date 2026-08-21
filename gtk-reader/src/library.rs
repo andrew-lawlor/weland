@@ -337,12 +337,24 @@ pub fn build_library_page(window: &ApplicationWindow, on_open: Rc<dyn Fn(&str)>)
 
     let search_entry = SearchEntry::builder().placeholder_text("Search title or author\u{2026}").hexpand(true).build();
 
+    // A single icon `MenuButton` + popover instead of two always-visible
+    // text buttons -- less toolbar width for something reached far less
+    // often than the search box or the status filters next to it. The two
+    // real buttons and their click handlers are unchanged, just relocated
+    // into `import_popover`'s child instead of a visible row.
     let import_book_btn = Button::with_label("Import Book\u{2026}");
     let import_folder_btn = Button::with_label("Import Folder\u{2026}");
-    let import_row = GtkBox::new(Orientation::Horizontal, 0);
-    import_row.add_css_class("linked");
-    import_row.append(&import_book_btn);
-    import_row.append(&import_folder_btn);
+    let import_menu = GtkBox::new(Orientation::Vertical, 4);
+    import_menu.set_margin_top(8);
+    import_menu.set_margin_bottom(8);
+    import_menu.set_margin_start(8);
+    import_menu.set_margin_end(8);
+    import_menu.append(&import_book_btn);
+    import_menu.append(&import_folder_btn);
+    let import_popover = gtk::Popover::new();
+    import_popover.set_child(Some(&import_menu));
+    let import_menu_btn = gtk::MenuButton::builder().icon_name("list-add-symbolic").popover(&import_popover).build();
+    import_menu_btn.set_tooltip_text(Some("Import a book or a folder of books"));
 
     // A headless buffer/tags/base-font, never attached to a visible
     // TextView -- `settings_ui::build_settings_dialog` needs *a* `TextTag`/
@@ -373,12 +385,18 @@ pub fn build_library_page(window: &ApplicationWindow, on_open: Rc<dyn Fn(&str)>)
         }
     }
 
-    let vocab_toggle_content = adw::ButtonContent::builder().icon_name("accessories-dictionary-symbolic").label("Vocab").build();
-    let vocab_btn = Button::builder().child(&vocab_toggle_content).build();
-    let share_toggle_content = adw::ButtonContent::builder().icon_name("network-wireless-symbolic").label("Share").build();
-    let share_btn = Button::builder().child(&share_toggle_content).build();
-    let settings_toggle_content = adw::ButtonContent::builder().icon_name("preferences-system-symbolic").label("Settings").build();
-    let settings_btn = Button::builder().child(&settings_toggle_content).build();
+    // Icon-only + tooltip, not `AdwButtonContent` icon+label -- these three
+    // are occasional actions (unlike search/status filters, used on every
+    // visit), and spelling each one out in text was most of what made the
+    // toolbar feel crowded. The icons are all standard GNOME/Adwaita
+    // symbolic names (dictionary, network, gear), recognizable on their own
+    // and backed by a tooltip either way.
+    let vocab_btn = Button::from_icon_name("accessories-dictionary-symbolic");
+    vocab_btn.set_tooltip_text(Some("Vocabulary"));
+    let share_btn = Button::from_icon_name("network-wireless-symbolic");
+    share_btn.set_tooltip_text(Some("Share books over LAN"));
+    let settings_btn = Button::from_icon_name("preferences-system-symbolic");
+    settings_btn.set_tooltip_text(Some("Settings"));
     let utility_row = GtkBox::new(Orientation::Horizontal, 0);
     utility_row.add_css_class("linked");
     utility_row.append(&vocab_btn);
@@ -421,6 +439,12 @@ pub fn build_library_page(window: &ApplicationWindow, on_open: Rc<dyn Fn(&str)>)
     status_spinner.set_visible(false);
     let status_label = Label::new(None);
     status_label.set_visible(false);
+    // Unbounded by default, a long book title (or file path, in an error
+    // message) in here would grow the toolbar's -- and so the whole
+    // window's -- natural width to fit it, instead of just truncating in
+    // place like every other title/author label in this file already does.
+    status_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    status_label.set_max_width_chars(40);
     // Built once here (before the empty-state view it's also placed into
     // below) so `ImportUi` can toggle its visibility on import start/finish.
     let empty_gif = crate::branding::forge_anvil_picture();
@@ -440,7 +464,7 @@ pub fn build_library_page(window: &ApplicationWindow, on_open: Rc<dyn Fn(&str)>)
     toolbar.append(&search_entry);
     toolbar.append(&status_spinner);
     toolbar.append(&status_label);
-    toolbar.append(&import_row);
+    toolbar.append(&import_menu_btn);
     toolbar.append(&utility_row);
 
     let sort_labels: Vec<&str> = SortMode::ALL.iter().map(|s| s.label()).collect();
@@ -690,7 +714,9 @@ pub fn build_library_page(window: &ApplicationWindow, on_open: Rc<dyn Fn(&str)>)
         let entries = entries.clone();
         let import_ui = import_ui.clone();
         let refresh_ui = refresh_ui.clone();
+        let import_popover = import_popover.clone();
         import_book_btn.connect_clicked(move |_| {
+            import_popover.popdown();
             let epub_filter = FileFilter::new();
             epub_filter.set_name(Some("EPUB books"));
             epub_filter.add_suffix("epub");
@@ -720,7 +746,9 @@ pub fn build_library_page(window: &ApplicationWindow, on_open: Rc<dyn Fn(&str)>)
         let entries = entries.clone();
         let import_ui = import_ui.clone();
         let refresh_ui = refresh_ui.clone();
+        let import_popover = import_popover.clone();
         import_folder_btn.connect_clicked(move |_| {
+            import_popover.popdown();
             let dialog = FileDialog::builder().title("Import Folder of EPUBs").accept_label("Import").build();
 
             let config_dir = config_dir.clone();
@@ -1172,7 +1200,10 @@ fn spawn_import_one(
 
     let config_dir_owned = (*config_dir).clone();
     let books_dir_owned = (*books_dir).clone();
-    let input_display = input.display().to_string();
+    // The file name alone, not the full path -- plenty to recognize which
+    // book this was about, and a lot less likely to need `status_label`'s
+    // ellipsizing to kick in for the common case.
+    let input_display = input.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| input.display().to_string());
     std::thread::spawn(move || {
         let _ = std::fs::create_dir_all(&books_dir_owned);
         let outcome = import_one(&config_dir_owned, &books_dir_owned, &input);
