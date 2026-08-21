@@ -1,56 +1,56 @@
 # weland
 
-*Named for Wēland, the smith-god of Germanic legend — imprisoned for his craft, who forged himself wings from what was left and flew free.*
-
-**An archival-grade, annotation-native ebook format — and the reader built to prove it.**
-
----
+*Wēland, smith-god of Germanic legend, was hamstrung and caged on an island by a king who coveted his craft. He forged himself wings from what was left of it, and flew.*
 
 <img width="915" height="971" alt="Badhild_in_Wielands_Schmiede" src="https://github.com/user-attachments/assets/09adf7b2-d45d-4a80-bdd6-aac341f1d9ba" />
 
-## Why weland
+**Weland Reader is a native GTK4 ebook app built on a format that refuses to cage your annotations the way a king once caged its namesake.** Highlights, notes, and voice memos live inside the book file itself — no account, no sidecar, no app-specific database. Hand someone the file and you've handed them everything.
 
-EPUB simulates paper — pages, spines, reflowable text. What it never simulated is the mark a reader leaves behind: a highlight, a margin note, a voice memo pinned to the line that mattered. Every app bolts that on as a private sidecar, tied to one account and one device, gone the moment you switch readers.
+## Weland Reader
 
-weland fixes this at the format level, not the app level. Every book compiles to one self-contained SQLite file — the same container format the Library of Congress already trusts for long-term preservation. Text is a structured, queryable AST, not flowed HTML. Annotations are first-class rows sitting next to the text they anchor to, addressed by Unicode offset so they survive reflow, font changes, even a structural revision of the book itself. A library becomes queryable — full-text search, cross-references — with no app quietly maintaining a shadow database to fake what the format should do natively.
+Open an EPUB or a `.wld` and get a real desktop reading app, not a wrapped webpage:
 
-**This isn't a pitch to replace EPUB as an authoring format.** Publishing happens in EPUB — that's where the tools and the whole industry already live, and weland fully supports converting from it. What weland replaces is what happens *after* a book is finished: the artifact you actually read, own, and mark up. `weland compile` turns an EPUB into a `.wld` the same way a compiler turns source into a binary — you don't hand-author the output, you author the source and let the build step add the value.
+- Highlights, text notes, and recorded voice notes, anchored straight into the text
+- Full-text search across a book — and across your whole library at once
+- A library-wide annotations browser: search and export every highlight and note you've ever made, in one place
+- Dictionary lookup with a personal vocab builder, exportable to Markdown/JSON
+- LAN sharing — find other Weland instances on your network and pull a book someone's offered, no cloud required
+- Sort/filter library view, per-book metadata editing, a pan/zoom image viewer, remappable keyboard shortcuts, a real preferences dialog
 
-## Why weland reader
+No webview, anywhere. Pure GTK4/libadwaita, native Pango rendering — a smaller attack surface for files of uncertain provenance, and a lighter footprint that runs as well on a Steam Deck as a desktop.
 
-`reader/` is the reference client — proof the format isn't just a spec on paper. Open a `.wld`, or import an EPUB directly, and get a full desktop reading app: highlights, text notes, recorded voice notes, a searchable multi-book library — none of it locked behind an account you don't control. Every annotation is a row in a file sitting on your disk; back it up, move it, hand it to someone.
+```sh
+cd gtk-reader
+cargo run -- path/to/book.wld   # or with no path, to open the library
+```
 
-It's a Tauri v2 app with a plain HTML/JS frontend — no bundler, no npm toolchain — and it's built sandboxed-by-default with explicit export on demand, specifically so it can ship as a real Flatpak on Flathub and on Steam, not just run from source.
+Voice-note playback needs `gst-plugins-good` at runtime (`GtkMediaFile` is GStreamer-backed). Most systems already have it as a transitive dependency of a browser; if not, `sudo pacman -S gst-plugins-good` on Arch, or your distro's equivalent.
 
-One deliberate choice worth naming: both readers scroll continuously rather than paginate. A page number in a reflowable format is computed from whatever font, size, and margins happen to be active right now — not a stable coordinate, a rendering artifact recalculated on the fly — so pagination's real benefit is a spatial-memory aid *within one session at fixed settings*, not a portable position; change the type size and "page 47" is a different page. That benefit is genuine, but narrow, and continuous scroll doesn't try to replicate it — this is a tradeoff, not a solved problem. What it buys back: no page-layout/reflow-on-resize engine to build and maintain, and a progress readout that's honest about what it actually is — a percentage through the content — instead of a page count implying more precision than reflowable text can back up.
+Flatpak packaging and a Steam Deck-specific pass are what's left before this is something you install instead of something you build.
 
-## Quickstart
+## The compiler
+
+`weland compile book.epub` turns an EPUB into a `.wld` the way a compiler turns source into a binary: a self-contained SQLite file, structured AST instead of flowed HTML, annotations as first-class rows instead of a bolted-on sidecar, full-text search built in from the start. Publishing still happens in EPUB — weland is what the book becomes once it's meant to be read, owned, and marked up.
 
 ```sh
 cargo install --path .
 
-weland compile book.epub              # -> book.wld
-weland inspect book.wld               # metadata, AST breakdown, assets, schema
-weland search book.wld "a phrase"     # FTS5 full-text search
+weland compile book.epub                   # -> book.wld
+weland inspect book.wld                    # metadata, AST breakdown, assets
+weland search book.wld "a phrase"          # FTS5 full-text search
 weland extract book.wld --out-dir ./assets
 weland export book.wld --format markdown   # or json / text
 ```
 
-```sh
-cd reader/src-tauri
-cargo run
-```
+## Who this is for
 
-`gtk-reader/` is a native GTK4 rewrite of the reader — same `weland` core, no webview. TOC, highlight/note/voice-note annotations, full-text search, dictionary lookup with a vocab builder, a preferences dialog, remappable keyboard shortcuts, a pan/zoom image viewer, and a library view with sort/filter/stats and per-book metadata editing are all in; packaging (Flatpak) and a Steam Deck-specific pass are the remaining stretch work. It needs `gst-plugins-good` installed at runtime for voice-note playback (`GtkMediaFile` is GStreamer-backed, and the `autoaudiosink` element it needs to reach real audio output lives in that package, not in `gst-plugins-base`). Most desktop systems already have it as a transitive dependency of a browser or video player; a minimal install may not. On Arch: `sudo pacman -S gst-plugins-good`.
+Indie ereader devs who want structure, search, and annotation storage for free instead of reimplementing all three on top of styled HTML. DRM-free publishers who want a reader's books to actually belong to them. Archivists building on a container already trusted for long-term preservation. Anyone for whom a book is a conversation, not a one-way read.
 
-```sh
-cd gtk-reader
-cargo run -- path/to/book.wld   # or with no path to open the library view
-```
+Not a pitch to replace EPUB as an authoring format — write in EPUB, read and own in weland.
 
-## The spec
+## The format
 
-A `.wld` file is a plain SQLite database — six tables, no proprietary container, readable by anything that speaks SQL:
+A `.wld` file is plain SQLite, six tables, no proprietary container — readable by anything that speaks SQL.
 
 ```mermaid
 erDiagram
@@ -107,24 +107,13 @@ erDiagram
     }
 ```
 
-- **`metadata`** — flat key/value pairs: `title`, `author`, `language`, `description`, `identifier`, `publisher`, `cover_asset_id`.
-- **`ast_nodes`** — the book itself, as a tree (`parent_id` self-reference) ordered by `ordinal`. `node_type` is one of `heading`, `paragraph`, `blockquote`, `list`, `table`, `image`, `thematic_break`, `footnote`. `attributes` is free-form JSON per type — headings carry `level`, images carry `asset_id`/`alt`/`caption`, tables carry `rows`, and text-bearing types carry `spans`: an array of `{ start, end, type }` marking inline formatting over `content` — `bold`, `italic`, `code`, `strikethrough`, `underline`, `highlight`, or `link` (with an `href`).
-- **`assets`** — binary blobs (cover art, embedded images, recorded voice notes), content-hash deduped so the same image never gets stored twice.
-- **`user_annotations`** — highlights, text notes, and voice notes, anchored to a node via `start_offset`/`end_offset`: **Unicode codepoint offsets into that node's `content`**, the same coordinate space `spans` uses — so an annotation survives font changes and reflow, because it was never tied to pixels in the first place. `type` is `highlight`, `text_note`, or `voice_note` today; `ink_sketch` is reserved in the schema for future drawing support. `asset_id` links a voice note to its audio blob.
-- **`table_of_contents`** — a tree (again via `parent_id`) independent of the AST's own nesting, each entry optionally pointing at the `ast_nodes` row it should jump to.
-- **`fts_nodes`** — an FTS5 index mirroring `ast_nodes.content`, powering `weland search` and the reader's search bar.
-
-## Who this is for
-
-- **Indie ereader devs** who'd rather get structure, search, and annotation storage for free than reimplement all three, badly, on top of styled HTML.
-- **DRM-free publishers and small presses** who want their books to actually belong to their readers.
-- **Archivists and librarians** who want a format built on a container already trusted for long-term preservation.
-- **Researchers, language learners, book clubs, serious annotators** — anyone for whom a book is a conversation, not a one-way read.
-
-## What this is not
-
-Not a pitch to dethrone EPUB's install base, and not an authoring format — write in EPUB, read and own in weland. Built because the problem is real, the fix is possible, and it's worth building well: a format made the way a craftsperson builds a tool meant to outlast them.
+- **`metadata`** — flat key/value: title, author, language, cover, and friends.
+- **`ast_nodes`** — the book as a tree, ordered by `ordinal`. Text-bearing nodes carry `spans` in `attributes`: inline formatting (`bold`, `italic`, `link`, …) as `{ start, end, type }` ranges over `content`.
+- **`assets`** — cover art, images, voice-note audio, content-hash deduped.
+- **`user_annotations`** — highlights, notes, voice notes, anchored by **Unicode codepoint offset** into a node's `content` — the same coordinate space `spans` uses, so an annotation survives font changes and reflow because it was never tied to pixels to begin with.
+- **`table_of_contents`** — its own tree, independent of the AST's nesting, each entry optionally pointing at the node it jumps to.
+- **`fts_nodes`** — an FTS5 mirror of every node's text, powering both `weland search` and the reader's own search bar.
 
 ---
 
-*A reference compiler (EPUB → `.wld`) and a reference reader client live in this repository. The specification is a work in progress — contributions welcome.*
+*Built the way a smith builds a tool meant to outlast the hand that forged it.*
