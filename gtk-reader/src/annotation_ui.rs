@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use gtk4::{
     self as gtk, gdk, glib, pango, prelude::*, Align, Box as GtkBox, Button, Entry, Label, MediaFile, Orientation,
-    PolicyType, Popover, ScrolledWindow, TextBuffer, TextIter, TextTag, TextView, TextWindowType,
+    PolicyType, Popover, ScrolledWindow, SearchEntry, TextBuffer, TextIter, TextTag, TextView, TextWindowType,
 };
 use rusqlite::Connection;
 use weland::db;
@@ -106,6 +106,14 @@ pub struct AnnotationState {
     // needs crate visibility rather than staying private like the
     // annotations list's own container.
     pub(crate) vocab_list_container: RefCell<Option<GtkBox>>,
+    // Current text of the annotations panel's search box, lowercased.
+    // Stored on `AnnotationState` (rather than threaded through every
+    // `refresh_annotation_list` caller) so create/edit/delete refreshes keep
+    // whatever filter the reader currently has active instead of clearing it.
+    list_filter: RefCell<String>,
+    // Same idea as `list_filter`, for `vocab_ui.rs`'s search box -- crate
+    // visibility for the same reason `vocab_list_container` needs it.
+    pub(crate) vocab_list_filter: RefCell<String>,
 }
 
 impl AnnotationState {
@@ -131,6 +139,8 @@ impl AnnotationState {
             current_popover: RefCell::new(None),
             title,
             vocab_list_container: RefCell::new(None),
+            list_filter: RefCell::new(String::new()),
+            vocab_list_filter: RefCell::new(String::new()),
         })
     }
 
@@ -806,11 +816,17 @@ fn find_annotation_near(
     best.map(|(_, ann, start, end)| (ann.clone(), start, end))
 }
 
-/// Builds the "Annotations" sidebar panel: every annotation in the book,
-/// each entry jumping to its node the same way a TOC entry does. Kept
-/// current by `refresh_annotation_list`, called after every create/edit/
-/// delete alongside the `AnnotationIndex` reload those already do.
-pub fn build_annotation_list_panel(state: &Rc<AnnotationState>) -> ScrolledWindow {
+/// Builds the "Annotations" sidebar panel: a search box filtering every
+/// annotation in the book by its kind, comment, or highlighted text, each
+/// entry jumping to its node the same way a TOC entry does. Kept current by
+/// `refresh_annotation_list`, called after every create/edit/delete
+/// alongside the `AnnotationIndex` reload those already do.
+pub fn build_annotation_list_panel(state: &Rc<AnnotationState>) -> GtkBox {
+    let search_entry = SearchEntry::builder().placeholder_text("Search annotations\u{2026}").build();
+    search_entry.set_margin_top(8);
+    search_entry.set_margin_start(8);
+    search_entry.set_margin_end(8);
+
     let list = GtkBox::new(Orientation::Vertical, 4);
     list.set_margin_top(8);
     list.set_margin_bottom(8);
@@ -820,7 +836,30 @@ pub fn build_annotation_list_panel(state: &Rc<AnnotationState>) -> ScrolledWindo
     *state.list_container.borrow_mut() = Some(list.clone());
     refresh_annotation_list(state);
 
-    ScrolledWindow::builder().child(&list).hscrollbar_policy(PolicyType::Never).width_request(220).build()
+    {
+        let state = state.clone();
+        search_entry.connect_changed(move |entry| {
+            *state.list_filter.borrow_mut() = entry.text().to_lowercase();
+            refresh_annotation_list(&state);
+        });
+    }
+
+    let scroller = ScrolledWindow::builder().child(&list).hscrollbar_policy(PolicyType::Never).vexpand(true).build();
+
+    let panel = GtkBox::new(Orientation::Vertical, 0);
+    panel.set_width_request(220);
+    panel.append(&search_entry);
+    panel.append(&scroller);
+    panel
+}
+
+fn kind_label(annotation_type: &str) -> &str {
+    match annotation_type {
+        "highlight" => "Highlight",
+        "text_note" => "Note",
+        "voice_note" => "Voice Note",
+        other => other,
+    }
 }
 
 fn refresh_annotation_list(state: &Rc<AnnotationState>) {
@@ -837,8 +876,19 @@ fn refresh_annotation_list(state: &Rc<AnnotationState>) {
         }
     }
 
+    let filter = state.list_filter.borrow();
+    if !filter.is_empty() {
+        rows.retain(|(_, ann)| {
+            kind_label(&ann.annotation_type).to_lowercase().contains(filter.as_str())
+                || ann.comment.as_deref().is_some_and(|c| c.to_lowercase().contains(filter.as_str()))
+                || ann.selected_text.as_deref().is_some_and(|t| t.to_lowercase().contains(filter.as_str()))
+        });
+    }
+
     if rows.is_empty() {
-        let empty = Label::new(Some("No annotations yet \u{2014} select text to highlight or add a note."));
+        let message =
+            if filter.is_empty() { "No annotations yet \u{2014} select text to highlight or add a note." } else { "No annotations match your search." };
+        let empty = Label::new(Some(message));
         empty.set_wrap(true);
         empty.set_halign(Align::Start);
         empty.add_css_class("dim-label");
@@ -847,12 +897,7 @@ fn refresh_annotation_list(state: &Rc<AnnotationState>) {
     }
 
     for (node, ann) in rows {
-        let kind = Label::new(Some(match ann.annotation_type.as_str() {
-            "highlight" => "Highlight",
-            "text_note" => "Note",
-            "voice_note" => "Voice Note",
-            other => other,
-        }));
+        let kind = Label::new(Some(kind_label(&ann.annotation_type)));
         kind.set_halign(Align::Start);
         kind.add_css_class("heading");
 

@@ -6,15 +6,22 @@
 
 use std::rc::Rc;
 
-use gtk4::{glib, prelude::*, Align, Box as GtkBox, Button, Label, Orientation, PolicyType, ScrolledWindow, Separator};
+use gtk4::{
+    glib, prelude::*, Align, Box as GtkBox, Button, Label, Orientation, PolicyType, ScrolledWindow, SearchEntry, Separator,
+};
 
 use crate::annotation_ui::AnnotationState;
 use crate::persistence;
 
-/// Builds the "Vocab" sidebar panel and registers its list container on
-/// `state` so `refresh_vocab_list` (called after every add/remove) knows
-/// what to rebuild.
-pub fn build_vocab_panel(state: &Rc<AnnotationState>) -> ScrolledWindow {
+/// Builds the "Vocab" sidebar panel (a search box plus the word list) and
+/// registers the list container on `state` so `refresh_vocab_list` (called
+/// after every add/remove) knows what to rebuild.
+pub fn build_vocab_panel(state: &Rc<AnnotationState>) -> GtkBox {
+    let search_entry = SearchEntry::builder().placeholder_text("Search vocab\u{2026}").build();
+    search_entry.set_margin_top(8);
+    search_entry.set_margin_start(8);
+    search_entry.set_margin_end(8);
+
     let list = GtkBox::new(Orientation::Vertical, 10);
     list.set_margin_top(8);
     list.set_margin_bottom(8);
@@ -24,7 +31,21 @@ pub fn build_vocab_panel(state: &Rc<AnnotationState>) -> ScrolledWindow {
     *state.vocab_list_container.borrow_mut() = Some(list.clone());
     refresh_vocab_list(state);
 
-    ScrolledWindow::builder().child(&list).hscrollbar_policy(PolicyType::Never).width_request(220).build()
+    {
+        let state = state.clone();
+        search_entry.connect_changed(move |entry| {
+            *state.vocab_list_filter.borrow_mut() = entry.text().to_lowercase();
+            refresh_vocab_list(&state);
+        });
+    }
+
+    let scroller = ScrolledWindow::builder().child(&list).hscrollbar_policy(PolicyType::Never).vexpand(true).build();
+
+    let panel = GtkBox::new(Orientation::Vertical, 0);
+    panel.set_width_request(220);
+    panel.append(&search_entry);
+    panel.append(&scroller);
+    panel
 }
 
 /// Rebuilds the vocab list from disk. Cheap enough to just do in full on
@@ -39,8 +60,23 @@ pub(crate) fn refresh_vocab_list(state: &Rc<AnnotationState>) {
 
     let Ok(config_dir) = persistence::config_dir() else { return };
     let mut entries = persistence::read_vocab(&config_dir).unwrap_or_default();
+
+    let filter = state.vocab_list_filter.borrow();
+    if !filter.is_empty() {
+        entries.retain(|e| {
+            e.word.to_lowercase().contains(filter.as_str())
+                || e.book_title.to_lowercase().contains(filter.as_str())
+                || e.definition.to_lowercase().contains(filter.as_str())
+        });
+    }
+
     if entries.is_empty() {
-        let empty = Label::new(Some("No saved words yet. Double-click a word, then \u{201c}Add to Vocab\u{201d} in its definition popup."));
+        let message = if filter.is_empty() {
+            "No saved words yet. Double-click a word, then \u{201c}Add to Vocab\u{201d} in its definition popup."
+        } else {
+            "No saved words match your search."
+        };
+        let empty = Label::new(Some(message));
         empty.set_wrap(true);
         empty.set_halign(Align::Start);
         empty.add_css_class("dim-label");
