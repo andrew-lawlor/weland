@@ -23,7 +23,7 @@ use gtk4::{
 use libadwaita::{self as adw, prelude::*, ApplicationWindow};
 use rusqlite::{Connection, OpenFlags};
 
-use crate::{document, persistence, persistence::LibraryEntry, settings_ui, sharing, vocab_ui};
+use crate::{annotation_ui, document, persistence, persistence::LibraryEntry, settings_ui, sharing, vocab_ui};
 
 const COVER_WIDTH: i32 = 110;
 const COVER_HEIGHT: i32 = 160;
@@ -385,14 +385,17 @@ pub fn build_library_page(window: &ApplicationWindow, on_open: Rc<dyn Fn(&str)>)
         }
     }
 
-    // Icon-only + tooltip, not `AdwButtonContent` icon+label -- these three
-    // are occasional actions (unlike search/status filters, used on every
+    // Icon-only + tooltip, not `AdwButtonContent` icon+label -- these are
+    // occasional actions (unlike search/status filters, used on every
     // visit), and spelling each one out in text was most of what made the
     // toolbar feel crowded. The icons are all standard GNOME/Adwaita
-    // symbolic names (dictionary, network, gear), recognizable on their own
-    // and backed by a tooltip either way.
+    // symbolic names, recognizable on their own and backed by a tooltip
+    // either way. "edit-symbolic" matches the reader sidebar's own
+    // Annotations tab icon for one consistent icon vocabulary.
     let vocab_btn = Button::from_icon_name("accessories-dictionary-symbolic");
     vocab_btn.set_tooltip_text(Some("Vocabulary"));
+    let annotations_btn = Button::from_icon_name("edit-symbolic");
+    annotations_btn.set_tooltip_text(Some("Annotations"));
     let share_btn = Button::from_icon_name("network-wireless-symbolic");
     share_btn.set_tooltip_text(Some("Share books over LAN"));
     let settings_btn = Button::from_icon_name("preferences-system-symbolic");
@@ -400,6 +403,7 @@ pub fn build_library_page(window: &ApplicationWindow, on_open: Rc<dyn Fn(&str)>)
     let utility_row = GtkBox::new(Orientation::Horizontal, 0);
     utility_row.add_css_class("linked");
     utility_row.append(&vocab_btn);
+    utility_row.append(&annotations_btn);
     utility_row.append(&share_btn);
     utility_row.append(&settings_btn);
 
@@ -407,6 +411,14 @@ pub fn build_library_page(window: &ApplicationWindow, on_open: Rc<dyn Fn(&str)>)
         let window = window.clone();
         vocab_btn.connect_clicked(move |_| {
             vocab_ui::build_vocab_window(&window);
+        });
+    }
+    {
+        let window = window.clone();
+        let config_dir = config_dir.clone();
+        let on_open = on_open.clone();
+        annotations_btn.connect_clicked(move |_| {
+            annotation_ui::build_library_annotations_window(&window, (*config_dir).clone(), on_open.clone());
         });
     }
     {

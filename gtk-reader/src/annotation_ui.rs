@@ -16,12 +16,15 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use gtk4::{
-    self as gtk, gdk, glib, pango, prelude::*, Align, Box as GtkBox, Button, Entry, Label, MediaFile, Orientation,
-    PolicyType, Popover, ScrolledWindow, SearchEntry, TextBuffer, TextIter, TextTag, TextView, TextWindowType,
+    self as gtk, gdk, gio, glib, pango, prelude::*, Align, Box as GtkBox, Button, Entry, FileFilter, Label, MediaFile,
+    Orientation, PolicyType, Popover, ScrolledWindow, SearchEntry, Separator, TextBuffer, TextIter, TextTag, TextView,
+    TextWindowType,
 };
+use libadwaita::{self as adw, prelude::*};
 use rusqlite::Connection;
 use weland::db;
 use weland::schema::{AstNode, UserAnnotation};
@@ -29,6 +32,7 @@ use weland::schema::{AstNode, UserAnnotation};
 use crate::annotations::AnnotationIndex;
 use crate::dictionary_ui;
 use crate::node_index::NodeIndex;
+use crate::persistence;
 use crate::recording;
 
 const ANNOTATABLE_TYPES: &[&str] = &["heading", "paragraph", "blockquote", "verse_line"];
@@ -820,10 +824,7 @@ fn find_annotation_near(
 /// `refresh_annotation_list`, called after every create/edit/delete
 /// alongside the `AnnotationIndex` reload those already do.
 pub fn build_annotation_list_panel(state: &Rc<AnnotationState>) -> GtkBox {
-    let search_entry = SearchEntry::builder().placeholder_text("Search annotations\u{2026}").build();
-    search_entry.set_margin_top(8);
-    search_entry.set_margin_start(8);
-    search_entry.set_margin_end(8);
+    let search_entry = SearchEntry::builder().placeholder_text("Search annotations\u{2026}").hexpand(true).build();
 
     let list = GtkBox::new(Orientation::Vertical, 4);
     list.set_margin_top(8);
@@ -842,13 +843,391 @@ pub fn build_annotation_list_panel(state: &Rc<AnnotationState>) -> GtkBox {
         });
     }
 
+    // Icon-only, in the same row as search rather than its own toolbar --
+    // this panel is only ~220px wide (the reader sidebar), the same
+    // "narrow panel, keep it minimal" reasoning `vocab_ui.rs` already
+    // follows by keeping its own export UI out of the equivalent narrow
+    // panel entirely (it lives in the library page's wider standalone vocab
+    // window instead). Annotations have no book-independent equivalent of
+    // that window -- they only ever make sense for the book currently
+    // open -- so export lives here, just kept to one compact icon button.
+    let export_md_btn = Button::with_label("Export as Markdown\u{2026}");
+    let export_json_btn = Button::with_label("Export as JSON\u{2026}");
+    let export_menu = GtkBox::new(Orientation::Vertical, 4);
+    export_menu.set_margin_top(8);
+    export_menu.set_margin_bottom(8);
+    export_menu.set_margin_start(8);
+    export_menu.set_margin_end(8);
+    export_menu.append(&export_md_btn);
+    export_menu.append(&export_json_btn);
+    let export_popover = Popover::new();
+    export_popover.set_child(Some(&export_menu));
+    let export_btn = gtk::MenuButton::builder().icon_name("document-save-symbolic").popover(&export_popover).build();
+    export_btn.set_tooltip_text(Some("Export annotations"));
+
+    {
+        let state = state.clone();
+        let export_popover = export_popover.clone();
+        export_md_btn.connect_clicked(move |btn| {
+            export_popover.popdown();
+            let title = state.title.clone();
+            let annotations = ordered_annotations(&state);
+            let widget = btn.clone().upcast::<gtk::Widget>();
+            run_export(&widget, "annotations.md", "Markdown files", "md", move |anns| export_annotations_markdown(&title, anns), annotations);
+        });
+    }
+    {
+        let state = state.clone();
+        let export_popover = export_popover.clone();
+        export_json_btn.connect_clicked(move |btn| {
+            export_popover.popdown();
+            let annotations = ordered_annotations(&state);
+            let widget = btn.clone().upcast::<gtk::Widget>();
+            run_export(&widget, "annotations.json", "JSON files", "json", export_annotations_json, annotations);
+        });
+    }
+
+    let search_row = GtkBox::new(Orientation::Horizontal, 4);
+    search_row.set_margin_top(8);
+    search_row.set_margin_start(8);
+    search_row.set_margin_end(8);
+    search_row.append(&search_entry);
+    search_row.append(&export_btn);
+
     let scroller = ScrolledWindow::builder().child(&list).hscrollbar_policy(PolicyType::Never).vexpand(true).build();
 
     let panel = GtkBox::new(Orientation::Vertical, 0);
     panel.set_width_request(220);
-    panel.append(&search_entry);
+    panel.append(&search_row);
     panel.append(&scroller);
     panel
+}
+
+/// Every annotation for the open book, in reading order (the order its
+/// nodes appear in the document) rather than the arbitrary order
+/// `AnnotationIndex`'s `HashMap` would iterate in -- both the list panel
+/// above and export below want "as you'd encounter them reading," not
+/// insertion/id order.
+/// Standalone "Annotations" window for the library page, spanning every
+/// book -- unlike the per-book panel (`build_annotation_list_panel`), which
+/// has a live `AnnotationState`/open SQLite connection to read from, this
+/// has to open every book in the library itself (`load_all_library_annotations`,
+/// off the main thread since it's an O(books) disk scan) before there's
+/// anything to show. `on_open` (the same callback `library.rs` already
+/// threads to every book card) is how clicking a result jumps to that book
+/// -- it lands at the book's last reading position, same as opening it from
+/// the grid, not at the exact annotation; scrolling straight to one
+/// specific annotation on open is a real feature but a separate one, not
+/// implemented here.
+pub fn build_library_annotations_window(parent: &impl IsA<gtk::Widget>, config_dir: std::path::PathBuf, on_open: Rc<dyn Fn(&str)>) -> adw::Dialog {
+    let search_entry = SearchEntry::builder().placeholder_text("Search annotations\u{2026}").build();
+    search_entry.set_margin_top(8);
+    search_entry.set_margin_start(8);
+    search_entry.set_margin_end(8);
+    search_entry.set_sensitive(false);
+
+    let list = GtkBox::new(Orientation::Vertical, 10);
+    list.set_margin_top(8);
+    list.set_margin_bottom(8);
+    list.set_margin_start(8);
+    list.set_margin_end(8);
+    let loading = Label::new(Some("Loading annotations\u{2026}"));
+    loading.add_css_class("dim-label");
+    list.append(&loading);
+
+    let scroller = ScrolledWindow::builder().child(&list).hscrollbar_policy(PolicyType::Never).vexpand(true).build();
+    let panel = GtkBox::new(Orientation::Vertical, 0);
+    panel.set_width_request(420);
+    panel.append(&search_entry);
+    panel.append(&scroller);
+
+    let export_md_btn = Button::with_label("Export as Markdown\u{2026}");
+    let export_json_btn = Button::with_label("Export as JSON\u{2026}");
+    let export_menu = GtkBox::new(Orientation::Vertical, 4);
+    export_menu.set_margin_top(8);
+    export_menu.set_margin_bottom(8);
+    export_menu.set_margin_start(8);
+    export_menu.set_margin_end(8);
+    export_menu.append(&export_md_btn);
+    export_menu.append(&export_json_btn);
+    let export_popover = Popover::new();
+    export_popover.set_child(Some(&export_menu));
+    let export_btn = gtk::MenuButton::builder().label("Export").popover(&export_popover).build();
+    export_btn.set_sensitive(false);
+
+    let header = adw::HeaderBar::new();
+    header.pack_end(&export_btn);
+    header.set_title_widget(Some(&Label::new(Some("Annotations"))));
+
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.add_top_bar(&header);
+    toolbar_view.set_content(Some(&panel));
+
+    let dialog = adw::Dialog::new();
+    dialog.set_presentation_mode(adw::DialogPresentationMode::Floating);
+    dialog.set_content_width(480);
+    dialog.set_content_height(600);
+    dialog.set_child(Some(&toolbar_view));
+
+    let entries: Rc<RefCell<Vec<LibraryAnnotation>>> = Rc::new(RefCell::new(Vec::new()));
+    let filter: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+
+    let render = {
+        let list = list.clone();
+        let entries = entries.clone();
+        let filter = filter.clone();
+        let dialog = dialog.clone();
+        let on_open = on_open.clone();
+        move || {
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+
+            let guard = entries.borrow();
+            let filter = filter.borrow();
+            let matches: Vec<&LibraryAnnotation> = guard.iter().filter(|e| library_annotation_matches_search(e, &filter)).collect();
+
+            if matches.is_empty() {
+                let message = if guard.is_empty() {
+                    "No annotations in your library yet."
+                } else {
+                    "No annotations match your search."
+                };
+                let empty = Label::new(Some(message));
+                empty.set_wrap(true);
+                empty.set_halign(Align::Start);
+                empty.add_css_class("dim-label");
+                list.append(&empty);
+                return;
+            }
+
+            for entry in matches {
+                let row = GtkBox::new(Orientation::Vertical, 2);
+
+                let book_label = Label::new(Some(&entry.book_title));
+                book_label.set_halign(Align::Start);
+                book_label.add_css_class("dim-label");
+                row.append(&book_label);
+
+                let kind = Label::new(Some(kind_label(&entry.annotation.annotation_type)));
+                kind.set_halign(Align::Start);
+                kind.add_css_class("heading");
+                row.append(&kind);
+
+                let snippet_text = entry.annotation.comment.clone().or_else(|| entry.annotation.selected_text.clone()).unwrap_or_default();
+                let snippet = Label::new(Some(&snippet_text));
+                snippet.set_halign(Align::Start);
+                snippet.set_wrap(true);
+                snippet.set_lines(2);
+                snippet.set_ellipsize(pango::EllipsizeMode::End);
+                row.append(&snippet);
+
+                let open_btn = Button::builder().child(&row).has_frame(false).build();
+                let book_path = entry.book_path.clone();
+                let on_open = on_open.clone();
+                let dialog = dialog.clone();
+                open_btn.connect_clicked(move |_| {
+                    dialog.close();
+                    on_open(&book_path);
+                });
+
+                list.append(&open_btn);
+                list.append(&Separator::new(Orientation::Horizontal));
+            }
+        }
+    };
+
+    {
+        let (tx, rx) = mpsc::channel::<Vec<LibraryAnnotation>>();
+        std::thread::spawn(move || {
+            let _ = tx.send(load_all_library_annotations(&config_dir));
+        });
+
+        let entries = entries.clone();
+        let search_entry = search_entry.clone();
+        let export_btn = export_btn.clone();
+        let render = render.clone();
+        glib::timeout_add_local(Duration::from_millis(150), move || match rx.try_recv() {
+            Ok(loaded) => {
+                *entries.borrow_mut() = loaded;
+                search_entry.set_sensitive(true);
+                export_btn.set_sensitive(true);
+                render();
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        });
+    }
+
+    {
+        let render = render.clone();
+        search_entry.connect_changed(move |entry| {
+            *filter.borrow_mut() = entry.text().to_lowercase();
+            render();
+        });
+    }
+
+    let root = parent.clone().upcast::<gtk::Widget>();
+    {
+        let root = root.clone();
+        let entries = entries.clone();
+        let export_popover = export_popover.clone();
+        export_md_btn.connect_clicked(move |_| {
+            export_popover.popdown();
+            run_export(&root, "annotations.md", "Markdown files", "md", export_library_annotations_markdown, entries.borrow().clone());
+        });
+    }
+    {
+        let export_popover = export_popover.clone();
+        export_json_btn.connect_clicked(move |_| {
+            export_popover.popdown();
+            run_export(&root, "annotations.json", "JSON files", "json", export_library_annotations_json, entries.borrow().clone());
+        });
+    }
+
+    dialog.present(Some(parent));
+    dialog
+}
+
+fn ordered_annotations(state: &AnnotationState) -> Vec<UserAnnotation> {
+    let guard = state.annotations.borrow();
+    let mut rows = Vec::new();
+    for node in &state.nodes {
+        rows.extend(guard.for_node(node.id).iter().cloned());
+    }
+    rows
+}
+
+/// Generic over `T` so the library-wide annotations window (see
+/// `build_library_annotations_window`) can reuse the exact same save-dialog
+/// plumbing over `LibraryAnnotation` instead of `UserAnnotation`.
+fn run_export<T: 'static>(parent: &gtk::Widget, initial_name: &str, filter_label: &str, suffix: &str, render: impl Fn(&[T]) -> String + 'static, items: Vec<T>) {
+    let filter = FileFilter::new();
+    filter.set_name(Some(filter_label));
+    filter.add_suffix(suffix);
+    let filters = gio::ListStore::new::<FileFilter>();
+    filters.append(&filter);
+
+    let dialog = gtk::FileDialog::builder().title("Export Annotations").accept_label("Export").initial_name(initial_name).build();
+    dialog.set_filters(Some(&filters));
+
+    let root = parent.clone().downcast::<gtk::Window>().ok().or_else(|| parent.root().and_then(|r| r.downcast::<gtk::Window>().ok()));
+    dialog.save(root.as_ref(), gio::Cancellable::NONE, move |result| {
+        let Ok(file) = result else { return };
+        let Some(path) = file.path() else { return };
+        let _ = std::fs::write(&path, render(&items));
+    });
+}
+
+/// One annotation's body in Markdown -- shared by the per-book export below
+/// and the library-wide one (`export_library_annotations_markdown`) so the
+/// two formats can't drift apart. A voice note's audio itself isn't
+/// included (there's no sensible way to embed it in text), just its
+/// transcript if one was captured in `comment` -- says so explicitly rather
+/// than silently omitting it.
+fn annotation_body_markdown(ann: &UserAnnotation) -> String {
+    let mut out = String::new();
+    if let Some(text) = ann.selected_text.as_deref().filter(|t| !t.is_empty()) {
+        out.push_str(&format!("> {text}\n\n"));
+    }
+    if let Some(comment) = ann.comment.as_deref().filter(|c| !c.is_empty()) {
+        out.push_str(comment);
+        out.push_str("\n\n");
+    }
+    if ann.annotation_type == "voice_note" && ann.asset_id.is_some() {
+        out.push_str("*(audio recording not included in this export)*\n\n");
+    }
+    out.push_str(&format!("*{}*\n\n---\n\n", ann.created_at));
+    out
+}
+
+/// Reading-order glossary of one book's annotations -- unlike vocab's
+/// alphabetical export, reading order is the more useful order here (an
+/// annotation only means something in the context of where it sits in the
+/// book).
+fn export_annotations_markdown(book_title: &str, annotations: &[UserAnnotation]) -> String {
+    let mut out = format!("# Annotations \u{2014} {book_title}\n\n");
+    for ann in annotations {
+        out.push_str(&format!("## {}\n\n", kind_label(&ann.annotation_type)));
+        out.push_str(&annotation_body_markdown(ann));
+    }
+    out
+}
+
+fn export_annotations_json(annotations: &[UserAnnotation]) -> String {
+    serde_json::to_string_pretty(annotations).unwrap_or_default()
+}
+
+/// One annotation plus which book it came from -- `UserAnnotation` alone
+/// only makes sense in the context of the single `.wld` file it was loaded
+/// from, which the per-book panel/export always has implicitly and the
+/// library-wide window never does.
+#[derive(Clone)]
+pub struct LibraryAnnotation {
+    pub book_title: String,
+    pub book_path: String,
+    pub annotation: UserAnnotation,
+}
+
+/// Opens a read-only connection to every book in the library and loads its
+/// annotations -- one SQLite open+query per book, so this belongs on a
+/// background thread (see `build_library_annotations_window`), same
+/// "don't block the main thread on a library-wide disk scan" reasoning as
+/// `library.rs`'s own language backfill and folder import.
+fn load_all_library_annotations(config_dir: &std::path::Path) -> Vec<LibraryAnnotation> {
+    let library_entries = persistence::read_library(config_dir).unwrap_or_default();
+    let mut all = Vec::new();
+    for entry in library_entries {
+        let Ok(conn) = Connection::open_with_flags(&entry.path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else { continue };
+        let Ok(annotations) = db::load_annotations(&conn) else { continue };
+        for annotation in annotations {
+            all.push(LibraryAnnotation { book_title: entry.title.clone(), book_path: entry.path.clone(), annotation });
+        }
+    }
+    all
+}
+
+fn library_annotation_matches_search(entry: &LibraryAnnotation, filter: &str) -> bool {
+    filter.is_empty()
+        || entry.book_title.to_lowercase().contains(filter)
+        || kind_label(&entry.annotation.annotation_type).to_lowercase().contains(filter)
+        || entry.annotation.comment.as_deref().is_some_and(|c| c.to_lowercase().contains(filter))
+        || entry.annotation.selected_text.as_deref().is_some_and(|t| t.to_lowercase().contains(filter))
+}
+
+/// Grouped by book (each appearing once, sorted alphabetically, entries
+/// within a book in reading order) -- flat/alphabetical-by-word made sense
+/// for vocab, but an annotation only means something in the context of the
+/// book it's from, so keeping that book's annotations together reads far
+/// better than interleaving books by annotation timestamp.
+fn export_library_annotations_markdown(entries: &[LibraryAnnotation]) -> String {
+    let mut sorted: Vec<&LibraryAnnotation> = entries.iter().collect();
+    sorted.sort_by(|a, b| a.book_title.to_lowercase().cmp(&b.book_title.to_lowercase()).then(a.annotation.created_at.cmp(&b.annotation.created_at)));
+
+    let mut out = String::from("# Annotations\n\n");
+    let mut current_book: Option<&str> = None;
+    for entry in sorted {
+        if current_book != Some(entry.book_title.as_str()) {
+            out.push_str(&format!("## {}\n\n", entry.book_title));
+            current_book = Some(entry.book_title.as_str());
+        }
+        out.push_str(&format!("### {}\n\n", kind_label(&entry.annotation.annotation_type)));
+        out.push_str(&annotation_body_markdown(&entry.annotation));
+    }
+    out
+}
+
+#[derive(serde::Serialize)]
+struct LibraryAnnotationRow<'a> {
+    book_title: &'a str,
+    #[serde(flatten)]
+    annotation: &'a UserAnnotation,
+}
+
+fn export_library_annotations_json(entries: &[LibraryAnnotation]) -> String {
+    let rows: Vec<LibraryAnnotationRow> = entries.iter().map(|e| LibraryAnnotationRow { book_title: &e.book_title, annotation: &e.annotation }).collect();
+    serde_json::to_string_pretty(&rows).unwrap_or_default()
 }
 
 fn kind_label(annotation_type: &str) -> &str {
@@ -1047,5 +1426,149 @@ pub(crate) mod tests {
         // "villei" (offsets 4..10) — a partial-word drag, ends mid-word.
         let (start, end) = (buffer.iter_at_offset(4), buffer.iter_at_offset(10));
         assert!(!selection_is_single_word(&start, &end), "a partial-word selection must not be treated as a single word");
+    }
+
+    fn test_annotation(annotation_type: &str, selected_text: Option<&str>, comment: Option<&str>, asset_id: Option<i64>) -> UserAnnotation {
+        UserAnnotation {
+            id: 1,
+            node_id: 1,
+            start_offset: 0,
+            end_offset: 0,
+            selected_text: selected_text.map(String::from),
+            annotation_type: annotation_type.to_string(),
+            comment: comment.map(String::from),
+            asset_id,
+            author_name: "Reader".to_string(),
+            author_id: None,
+            device_id: None,
+            created_at: "2026-08-21 12:00:00".to_string(),
+            updated_at: "2026-08-21 12:00:00".to_string(),
+        }
+    }
+
+    // Pure formatting -- no GTK involved, so these are ordinary #[test]s
+    // rather than part of the manually-driven `gtk_backed_checks` group.
+    #[test]
+    fn annotation_markdown_export_includes_kind_quote_and_comment() {
+        let annotations = vec![
+            test_annotation("highlight", Some("a golden sentence"), None, None),
+            test_annotation("text_note", Some("the passage"), Some("worth rereading"), None),
+        ];
+        let out = export_annotations_markdown("The Odyssey", &annotations);
+
+        assert!(out.starts_with("# Annotations \u{2014} The Odyssey\n\n"));
+        assert!(out.contains("## Highlight"));
+        assert!(out.contains("> a golden sentence"));
+        assert!(out.contains("## Note"));
+        assert!(out.contains("> the passage"));
+        assert!(out.contains("worth rereading"));
+    }
+
+    #[test]
+    fn annotation_markdown_export_flags_voice_note_audio_as_not_included() {
+        let annotations = vec![test_annotation("voice_note", Some("a line worth remembering"), Some("transcribed thought"), Some(42))];
+        let out = export_annotations_markdown("Beowulf", &annotations);
+
+        assert!(out.contains("## Voice Note"));
+        assert!(out.contains("transcribed thought"), "a captured transcript must still be included");
+        assert!(out.contains("audio recording not included"), "must be explicit that the audio itself isn't in the export");
+    }
+
+    #[test]
+    fn annotation_json_export_round_trips_every_field() {
+        let annotations = vec![test_annotation("highlight", Some("text"), None, None)];
+        let json = export_annotations_json(&annotations);
+        let parsed: Vec<UserAnnotation> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].annotation_type, "highlight");
+        assert_eq!(parsed[0].selected_text.as_deref(), Some("text"));
+    }
+
+    fn library_annotation(book_title: &str, annotation_type: &str, selected_text: Option<&str>, comment: Option<&str>) -> LibraryAnnotation {
+        LibraryAnnotation {
+            book_title: book_title.to_string(),
+            book_path: format!("/books/{book_title}.wld"),
+            annotation: test_annotation(annotation_type, selected_text, comment, None),
+        }
+    }
+
+    #[test]
+    fn library_annotation_search_matches_book_title_too() {
+        let entry = library_annotation("The Odyssey", "highlight", Some("wine-dark sea"), None);
+        assert!(library_annotation_matches_search(&entry, ""));
+        assert!(library_annotation_matches_search(&entry, "odyssey"), "must match the book title, not just the annotation content");
+        assert!(library_annotation_matches_search(&entry, "wine-dark"));
+        assert!(!library_annotation_matches_search(&entry, "beowulf"));
+    }
+
+    #[test]
+    fn library_markdown_export_groups_by_book_alphabetically() {
+        let entries = vec![
+            library_annotation("The Poetic Edda", "highlight", Some("a"), None),
+            library_annotation("Beowulf", "highlight", Some("b"), None),
+            library_annotation("Beowulf", "text_note", Some("c"), Some("second Beowulf note")),
+        ];
+        let out = export_library_annotations_markdown(&entries);
+
+        let beowulf_pos = out.find("## Beowulf").expect("must have a Beowulf section");
+        let edda_pos = out.find("## The Poetic Edda").expect("must have a Poetic Edda section");
+        assert!(beowulf_pos < edda_pos, "books must be grouped and sorted alphabetically, not left in input order");
+        // Only one "## Beowulf" heading even though it has two annotations.
+        assert_eq!(out.matches("## Beowulf").count(), 1, "a book with multiple annotations must get one section, not one per annotation");
+        assert!(out.contains("second Beowulf note"));
+    }
+
+    #[test]
+    fn library_json_export_includes_book_title_flattened_with_annotation_fields() {
+        let entries = vec![library_annotation("Beowulf", "highlight", Some("text"), None)];
+        let json = export_library_annotations_json(&entries);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let row = &parsed[0];
+        assert_eq!(row["book_title"], "Beowulf");
+        assert_eq!(row["annotation_type"], "highlight");
+        assert_eq!(row["selected_text"], "text");
+    }
+
+    #[test]
+    fn load_all_library_annotations_aggregates_across_books() {
+        let dir = tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        // Two minimal but real .wld files, each with one ast_node and one
+        // annotation on it -- not a full EPUB compile (irrelevant here),
+        // just enough real schema for `db::load_annotations` to read back.
+        for (title, text) in [("Book A", "highlight in A"), ("Book B", "note in B")] {
+            let path = dir.path().join(format!("{title}.wld"));
+            let conn = Connection::open(&path).unwrap();
+            weland::schema::init_db(&conn).unwrap();
+            let node_id: i64 = conn
+                .query_row(
+                    "INSERT INTO ast_nodes (ordinal, node_type, content) VALUES (0, 'paragraph', 'x') RETURNING id",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            weland_db::insert_annotation(
+                &conn,
+                weland_db::NewAnnotation {
+                    node_id,
+                    start_offset: 0,
+                    end_offset: 4,
+                    selected_text: Some(text.to_string()),
+                    annotation_type: "highlight".to_string(),
+                    comment: None,
+                    asset_id: None,
+                    author_name: "Reader".to_string(),
+                },
+            )
+            .unwrap();
+            persistence::upsert_library_entry(&config_dir, &path.to_string_lossy(), title, None, None, None).unwrap();
+        }
+
+        let all = load_all_library_annotations(&config_dir);
+        assert_eq!(all.len(), 2, "must aggregate one annotation from each of the two books");
+        assert!(all.iter().any(|e| e.book_title == "Book A" && e.annotation.selected_text.as_deref() == Some("highlight in A")));
+        assert!(all.iter().any(|e| e.book_title == "Book B" && e.annotation.selected_text.as_deref() == Some("note in B")));
     }
 }
